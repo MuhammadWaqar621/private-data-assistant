@@ -1,0 +1,13 @@
+# The image installs its own dependencies and runs its own build (see
+# Dockerfile), so a local `npm install` / `npm run build` must not be
+# copied in over the top of them - a host node_modules built on a
+# different platform would silently replace the container's.
+node_modules
+dist
+*.tsbuildinfo
+
+# Belt and braces: an inline VITE_* environment variable already beats a
+# .env file in Vite's own precedence, so the build ARG would win anyway -
+# but there is no reason to ship the local dev file into the image.
+.env
+.env.*.local

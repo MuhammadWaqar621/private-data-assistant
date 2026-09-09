@@ -1,0 +1,87 @@
+name: private-data-assistant
+
+# Note what is NOT in here: any of the databases this product queries.
+# Those are the USER's own external databases, registered at runtime
+# through POST /api/connections - they are not part of this stack, and
+# nothing here needs to know about them. `postgres` below is this
+# application's own metadata store (users, chats, messages, connection
+# records), nothing more.
+#
+# To try the whole thing end to end against a real database, spin up a
+# throwaway one yourself and register it - see
+# docs/testing-with-a-sample-database.md.
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: private-data-assistant-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: private_data_assistant
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: private-data-assistant-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  backend:
+    build:
+      context: ./backend
+    container_name: private-data-assistant-backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      QDRANT_URL: ${QDRANT_URL}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    volumes:
+      # Bind-mounted so uploaded SQLite databases
+      # (backend/storage/{user_id}/{connection_id}/database.sqlite) survive
+      # container restarts without a dedicated volume, and so --reload
+      # picks up code changes.
+      - ./backend:/app
+
+  # The React + Vite app, built to static files and served by `serve` on
+  # 4173. VITE_API_BASE_URL is a BUILD ARG rather than a runtime
+  # environment variable because Vite inlines VITE_* vars at build time -
+  # and it must be a URL the BROWSER can reach (the browser calls the
+  # backend directly, it is not proxied through this container).
+  # See frontend/README.md.
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8000}
+    container_name: private-data-assistant-frontend
+    restart: unless-stopped
+    ports:
+      - "4173:4173"
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:
+  qdrant_data:

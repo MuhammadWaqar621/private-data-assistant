@@ -1,0 +1,37 @@
+# Secrets / local env
+.env
+.env.*.local
+
+# Node
+node_modules/
+dist/
+npm-debug.log*
+*.tsbuildinfo
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Uploaded SQLite databases registered as connections
+# (storage/{user_id}/{connection_id}/database.sqlite)
+storage/
+
+# Local Claude Code settings/config (not relevant to other contributors)
+.claude/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Docker
+*.pid

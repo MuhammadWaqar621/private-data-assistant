@@ -1,0 +1,12 @@
+Generic single-database configuration.
+
+env.py reads DATABASE_URL from app.core.config.get_settings() rather than
+from alembic.ini, so the connection string lives in one place (.env).
+
+    docker-compose exec backend alembic upgrade head
+
+Or from the host (note `localhost`, not the docker service name `postgres`):
+
+    cd backend
+    DATABASE_URL=postgresql://postgres:postgres@localhost:5432/private_data_assistant \
+        alembic upgrade head
