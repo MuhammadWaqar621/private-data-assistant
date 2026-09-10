@@ -2,7 +2,6 @@ import { Link } from "react-router-dom";
 import { BarChart3, Database, Lock, ShieldCheck } from "lucide-react";
 
 import ThemeToggle from "../components/ThemeToggle";
-import { useConfigStatus } from "../lib/useConfigStatus";
 
 function Logo() {
   return (
@@ -13,21 +12,6 @@ function Logo() {
       <span className="text-lg font-bold tracking-tight text-slate-900 dark:text-white">
         Private Data Assistant
       </span>
-    </div>
-  );
-}
-
-function StatusPill({ label, ok }: { label: string; ok: boolean }) {
-  return (
-    <div
-      className={`flex items-center justify-between rounded-lg border px-3 py-1.5 text-xs ${
-        ok
-          ? "border-green-200 bg-green-50 text-green-800 dark:border-green-800 dark:bg-green-950 dark:text-green-300"
-          : "border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-300"
-      }`}
-    >
-      <span className="font-medium">{label}</span>
-      <span>{ok ? "configured" : "missing"}</span>
     </div>
   );
 }
@@ -69,8 +53,6 @@ const steps = [
 ];
 
 export default function HomePage() {
-  const { status, error } = useConfigStatus();
-
   return (
     <div className="flex min-h-screen flex-col bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100">
       <header className="border-b border-slate-200 bg-white/80 backdrop-blur dark:border-slate-800 dark:bg-slate-950/80">
@@ -168,41 +150,6 @@ export default function HomePage() {
           </ol>
         </section>
 
-        <section className="mx-auto max-w-5xl px-6 pb-20">
-          <div className="rounded-xl border border-slate-200 bg-white p-6 shadow-card dark:border-slate-800 dark:bg-slate-900">
-            <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-400 dark:text-slate-500">
-              Live demo status
-            </h2>
-            <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">
-              This deployment's backend configuration, checked in real time.
-              Sign-up and login work regardless of what's shown below;
-              registering a database and asking questions need the first two.
-            </p>
-
-            {error && (
-              <p className="mt-4 text-sm text-red-600 dark:text-red-400">
-                Could not reach the backend ({error}). Is it running?
-              </p>
-            )}
-
-            {!error && !status && (
-              <p className="mt-4 text-sm text-slate-500 dark:text-slate-400">
-                Checking configuration...
-              </p>
-            )}
-
-            {status && (
-              <div className="mt-4 grid gap-2 sm:grid-cols-2">
-                <StatusPill
-                  label={`AI (embeddings + ${status.llm_provider === "azure" ? "Azure" : "Groq"} chat)`}
-                  ok={status.connections_llm}
-                />
-                <StatusPill label="Credential encryption" ok={status.encryption} />
-                <StatusPill label="SMTP (email)" ok={status.smtp} />
-              </div>
-            )}
-          </div>
-        </section>
       </main>
 
       <footer className="border-t border-slate-200 bg-white px-6 py-6 text-center text-xs text-slate-400 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-500">
