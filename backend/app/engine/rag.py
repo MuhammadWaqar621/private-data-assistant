@@ -5,7 +5,10 @@ The agentic text-to-query engine.
 calls. The model is given two real tools and decides for itself, per
 message, whether the question needs data at all - there is no Python
 branching between canned prompts, and no keyword detection of "is this a
-greeting".
+greeting". `schema_context` (app/engine/schema_rag.py) and
+`example_context` (app/engine/example_rag.py) are both retrieved by the
+caller from Qdrant BEFORE this function is called - this module never
+queries Qdrant itself, only assembles what it's handed into the prompt.
 
   - `run_query(query)`   - one string argument. For a SQL connection that
                            string is SQL the model wrote; for a MongoDB
@@ -286,6 +289,33 @@ def _history_messages(history: Optional[Sequence[HistoryMessage]]) -> List[dict]
     return messages
 
 
+def _example_context_message(example_context: str) -> Optional[dict]:
+    """Few-shot worked examples (see app/engine/example_rag.py): past
+    questions asked against this same connection, paired with the exact
+    read-only query that answered them - either seeded from the schema's
+    foreign-key relationships at registration time, or captured from a
+    real successful run_query call. Omitted entirely when there's nothing
+    relevant yet (a brand new connection with no FK relationships and no
+    usage history), unlike the schema context's "none matched" case -
+    examples are a helpful nudge, never something the model needs telling
+    it's missing."""
+    if not (example_context or "").strip():
+        return None
+    return {
+        "role": "system",
+        "content": (
+            "SIMILAR PAST QUESTIONS - worked examples of the query style "
+            "this database needs, from past questions asked against this "
+            "same connection (some seeded from its foreign-key "
+            "relationships, some from real prior turns). Use them as a "
+            "pattern for table names, join syntax, and column naming when "
+            "they're relevant to the current question - but always write a "
+            "fresh query tailored to what's actually being asked now, and "
+            "ignore any example that doesn't fit.\n\n" + example_context
+        ),
+    }
+
+
 def _schema_context_message(schema_context: str, has_connection: bool) -> Optional[dict]:
     if not has_connection:
         return None
@@ -358,6 +388,7 @@ async def stream_agentic_reply(
     chat_history: Optional[Sequence[HistoryMessage]],
     message: str,
     schema_context: str = "",
+    example_context: str = "",
 ) -> AsyncGenerator[Dict[str, Any], Optional[Dict[str, Any]]]:
     """Drive one assistant turn, yielding a discriminated stream of events.
 
@@ -394,6 +425,9 @@ async def stream_agentic_reply(
     schema_message = _schema_context_message(schema_context, has_connection)
     if schema_message is not None:
         messages.append(schema_message)
+    example_message = _example_context_message(example_context) if has_connection else None
+    if example_message is not None:
+        messages.append(example_message)
     messages.extend(_history_messages(chat_history))
     messages.append({"role": "user", "content": message})
 

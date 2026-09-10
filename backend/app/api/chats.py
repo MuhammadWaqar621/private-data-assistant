@@ -27,7 +27,7 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
 from app.db.session import get_db
-from app.models import Chat, DatabaseConnection, MessageRole, User
+from app.models import Chat, ConnectionStatus, DatabaseConnection, MessageRole, User
 
 DEFAULT_TITLE = "New chat"
 
@@ -110,17 +110,45 @@ def create_chat(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> Chat:
-    if body.connection_id is not None:
-        _require_owned_connection(db, body.connection_id, current_user)
+    connection_id = body.connection_id
+    if connection_id is not None:
+        _require_owned_connection(db, connection_id, current_user)
+    else:
+        # If this user has registered exactly one database, there is
+        # nothing to choose between - default every new chat to it rather
+        # than making them open the selector and pick the only option.
+        # Only `ready` connections count: a `pending`/`indexing`/`failed`
+        # one isn't usable yet, so defaulting to it would just trade one
+        # piece of friction for a confusing "why doesn't this work" one.
+        # As soon as a second connection exists, this stops applying and
+        # new chats go back to starting unbound, same as always.
+        ready_connections = (
+            db.query(DatabaseConnection)
+            .filter(
+                DatabaseConnection.user_id == current_user.id,
+                DatabaseConnection.status == ConnectionStatus.ready,
+            )
+            .limit(2)
+            .all()
+        )
+        if len(ready_connections) == 1:
+            connection_id = ready_connections[0].id
 
     # At most one untitled, unbound, empty chat per user at a time: reuse
     # an existing one instead of stacking duplicates when "+ New chat" is
     # clicked repeatedly. Checked against the database, so it can't go
-    # stale the way a client-side check could.
+    # stale the way a client-side check could. Matched against the
+    # RESOLVED connection_id (post auto-default), not body.connection_id -
+    # an existing empty chat only counts as reusable if it already has the
+    # same binding a fresh one would get, auto-default included.
     if body.title is None and body.connection_id is None:
         existing_empty = (
             db.query(Chat)
-            .filter(Chat.user_id == current_user.id, Chat.title == DEFAULT_TITLE)
+            .filter(
+                Chat.user_id == current_user.id,
+                Chat.title == DEFAULT_TITLE,
+                Chat.connection_id == connection_id,
+            )
             .filter(~Chat.messages.any())
             .order_by(Chat.created_at.desc())
             .first()
@@ -132,7 +160,7 @@ def create_chat(
     chat = Chat(
         user_id=current_user.id,
         title=body.title or DEFAULT_TITLE,
-        connection_id=body.connection_id,
+        connection_id=connection_id,
     )
     db.add(chat)
     db.commit()

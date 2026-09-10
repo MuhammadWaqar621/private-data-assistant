@@ -53,7 +53,7 @@ from app.core.crypto import (
     decrypt_secret,
 )
 from app.db.session import get_db
-from app.engine import schema_rag
+from app.engine import example_rag, schema_rag
 from app.engine.azure_client import ai_configured
 from app.engine.db_adapters import get_adapter
 from app.engine.db_adapters.base import ConnectionInfo
@@ -284,12 +284,76 @@ def provision_connection(db: Session, connection: DatabaseConnection) -> Databas
     except Exception as exc:  # noqa: BLE001
         return _fail(db, connection, f"Could not index the database schema: {exc}")
 
+    # Few-shot example queries (app/engine/example_rag.py): one per
+    # foreign-key relationship, derived deterministically from the schema
+    # just indexed above. Best-effort and non-fatal on purpose - unlike
+    # schema indexing, a connection is still fully usable with zero
+    # examples (the model just has one less nudge on its first question),
+    # so a Qdrant hiccup here must never flip a `ready` connection to
+    # `failed`. Cleared first for the same re-index reason as the schema.
+    try:
+        example_rag.delete_connection_examples(connection.user_id, connection.id)
+        example_rag.seed_fk_join_examples(
+            user_id=connection.user_id,
+            connection_id=connection.id,
+            engine_name=connection.engine.value,
+            tables=tables,
+        )
+    except Exception:  # noqa: BLE001 - optional polish, never blocks registration
+        pass
+
     connection.status = ConnectionStatus.ready
     connection.error_message = None
     connection.schema_indexed_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(connection)
     return connection
+
+
+def _reject_if_duplicate(
+    db: Session,
+    user: User,
+    engine: DatabaseEngine,
+    host: Optional[str],
+    port: Optional[int],
+    database_name: str,
+) -> None:
+    """A user cannot register the same database twice - identified by
+    (engine, host, port, database_name) for network engines, or
+    (engine, database_name) for SQLite, which has no host/port at all.
+    Host is a DNS name/IP, so compared case-insensitively; database_name
+    is compared exactly, since database/collection names are routinely
+    case-sensitive.
+
+    This is deliberately narrower than just "same name": two different
+    servers happening to both have a database called `analytics` are NOT
+    the same database and must both be registerable. It is deliberately
+    NOT scoped to username/password - the same physical database
+    registered under two different credentials is still the same
+    database, and letting it in twice would just mean asking Qdrant to
+    index (and the model to search) the identical schema under two
+    different connection_ids for no benefit."""
+    existing = (
+        db.query(DatabaseConnection)
+        .filter(
+            DatabaseConnection.user_id == user.id,
+            DatabaseConnection.engine == engine,
+            DatabaseConnection.database_name == database_name,
+        )
+        .all()
+    )
+    normalized_host = (host or "").strip().lower() or None
+    for connection in existing:
+        if (connection.host or "").strip().lower() == normalized_host and connection.port == port:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"You've already registered this {engine.value} database "
+                    f"({connection.name!r}) - use that connection instead of "
+                    "adding a duplicate, or delete it first if you want to "
+                    "re-register it."
+                ),
+            )
 
 
 def _sqlite_dir(user_id: int, connection_id: int) -> Path:
@@ -320,6 +384,11 @@ def create_connection(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"A host is required for a {body.engine.value} connection.",
         )
+
+    resolved_port = body.port or _DEFAULT_PORTS.get(body.engine)
+    _reject_if_duplicate(
+        db, current_user, body.engine, body.host, resolved_port, body.database_name
+    )
 
     encrypted_password = encrypt_secret(body.password) if body.password else None
 
@@ -365,11 +434,16 @@ def create_sqlite_connection(
             detail="A name is required.",
         )
 
+    sqlite_database_name = file.filename or SQLITE_FILENAME
+    _reject_if_duplicate(
+        db, current_user, DatabaseEngine.sqlite, None, None, sqlite_database_name
+    )
+
     connection = DatabaseConnection(
         user_id=current_user.id,
         name=label,
         engine=DatabaseEngine.sqlite,
-        database_name=(file.filename or SQLITE_FILENAME),
+        database_name=sqlite_database_name,
         extra_params={},
         status=ConnectionStatus.pending,
     )
@@ -474,6 +548,10 @@ def delete_connection(
     try:
         schema_rag.delete_connection_schema(connection.user_id, connection.id)
     except Exception:  # noqa: BLE001 - a Qdrant hiccup shouldn't block the delete
+        pass
+    try:
+        example_rag.delete_connection_examples(connection.user_id, connection.id)
+    except Exception:  # noqa: BLE001
         pass
 
     if connection.engine == DatabaseEngine.sqlite:

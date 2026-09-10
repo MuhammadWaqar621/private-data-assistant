@@ -196,8 +196,35 @@ POST /api/connections            ->  row created, status=pending
    |        {user_id, connection_id, engine, table_name, text}
    |        (old points for this connection are deleted first)
    |
+   |-- example_rag.seed_fk_join_examples(...)      best-effort, non-fatal
+   |        one worked (question, query) example PER FOREIGN KEY,
+   |        derived deterministically from the schema just indexed above -
+   |        no LLM call. A child table with a FK to a parent becomes
+   |        "list each <child> together with its related <parent>", with
+   |        the literal correct JOIN already written using the real
+   |        PK/FK column names (a $lookup aggregate for MongoDB). Capped
+   |        at 12 examples; upserted into a SECOND Qdrant collection
+   |        (private_data_assistant_examples), same {user_id,
+   |        connection_id} tagging as the schema collection.
+   |
    `-- status=ready, schema_indexed_at=now
 ```
+
+**Registering a database you've already registered is rejected (409).**
+Identified by `(engine, host, port, database_name)` for a network engine,
+or `(engine, database_name)` for SQLite - not by name, and not by
+credentials, so the same physical database under two different logins
+still counts as a duplicate, while the same database name on two different
+hosts does not.
+
+**If you only have one database, new chats default to it.** `POST
+/api/chats` with no `connection_id` in the body checks how many `ready`
+connections you have; with exactly one, the new chat is bound to it
+automatically instead of leaving you to open the selector and pick the
+only option. As soon as a second connection exists, this stops applying
+and new chats go back to starting unbound - you can always change a
+chat's connection later via `PATCH /api/chats/{id}`, at any point, mid
+conversation, to any of your `ready` connections.
 
 **1. You POST the connection details.** Network engines
 (`postgres`/`mysql`/`mssql`/`mongodb`) send JSON; SQLite uploads the
@@ -270,6 +297,12 @@ POST /api/chats/{id}/messages  {"content": "revenue by country?"}
    |        search Qdrant with must-filters on user_id AND connection_id
    |        -> the top-8 matching table chunks, joined into one string
    |        (Qdrant only - your database is NOT touched here)
+   |
+   |-- example_rag.retrieve_relevant_examples(user_id, connection_id, question)
+   |        same embed + must-filter search, against the SECOND Qdrant
+   |        collection - the top-3 most similar past (question, query)
+   |        pairs for this connection (seeded FK examples and/or real
+   |        past turns), or "" if nothing is indexed yet
    |
    |-- persist the user Message; auto-title the chat if it's the first
    |
@@ -351,6 +384,22 @@ chart plus its data. Reloading the chat shows you exactly what was executed
 against your database to produce each answer - which matters much more here
 than in a document-RAG product, because the assistant is writing queries
 against live systems.
+
+**Every successful query becomes a future few-shot example.** After a turn
+where `run_query` came back `ok: true`, `app/api/messages.py` calls
+`example_rag.index_example(user_id, connection_id, engine_name, question,
+query_sql)` - best-effort, off the request thread, never affecting what the
+user already saw. The point id is a deterministic UUID of `(user_id,
+connection_id, normalized question)`, so asking the same question again
+overwrites the stored example with whatever query most recently answered
+it, rather than accumulating duplicates. This is what makes retrieval
+improve with use: a hard cross-domain question this connection's users
+keep asking becomes a worked example for the next person who asks
+something similar, on top of the FK-derived examples seeded at
+registration. Like the schema context, the example context is included
+whether or not the model ends up needing it this turn - it's the model's
+own judgment (see "the model decides whether to query" above) that
+determines whether a tool actually gets called.
 
 ---
 
@@ -1023,6 +1072,7 @@ the app. Either way the values come from the same file - docker-compose's
 | `QDRANT_URL` | Qdrant base URL (local container or Qdrant Cloud) | Yes |
 | `QDRANT_API_KEY` | Qdrant Cloud API key (blank for the local container) | Optional |
 | `QDRANT_COLLECTION` | Collection holding schema vectors | Optional (default `private_data_assistant_schema`) |
+| `QDRANT_EXAMPLES_COLLECTION` | Collection holding few-shot (question -> query) example vectors | Optional (default `private_data_assistant_examples`) |
 | `FRONTEND_URL` | Used to build password-reset links | Yes |
 | `VITE_API_BASE_URL` | Read by docker-compose as a **build arg** for the frontend image (Vite inlines `VITE_*` at build time) | Yes, for the compose frontend build |
 | `STORAGE_DIR` | Where uploaded SQLite files go, as `{STORAGE_DIR}/{user_id}/{connection_id}/database.sqlite` | Optional (default `storage`) |

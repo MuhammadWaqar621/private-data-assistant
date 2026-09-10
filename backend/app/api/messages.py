@@ -56,7 +56,7 @@ from app.api.deps import get_current_user
 from app.core.config import get_settings
 from app.core.crypto import DecryptionError, EncryptionNotConfiguredError
 from app.db.session import SessionLocal, get_db
-from app.engine import schema_rag
+from app.engine import example_rag, schema_rag
 from app.engine.azure_client import ai_configured
 from app.engine.db_adapters import get_adapter
 from app.engine.db_adapters.base import ConnectionInfo
@@ -193,8 +193,9 @@ async def send_message(
                 detail={"error": "credentials_unavailable", "message": str(exc)},
             )
 
-    # --- schema context (Qdrant only - never the live database) -----------
+    # --- schema + example context (Qdrant only - never the live database) -
     schema_context = ""
+    example_context = ""
     if connection_id is not None:
         try:
             schema_context = await run_in_threadpool(
@@ -207,6 +208,17 @@ async def send_message(
             # kill the turn: the model is told it has no schema context and
             # will say so rather than guessing table names.
             schema_context = ""
+        try:
+            example_context = await run_in_threadpool(
+                example_rag.retrieve_relevant_examples,
+                user_id,
+                connection_id,
+                body.content,
+            )
+        except Exception:  # noqa: BLE001 - examples are a nice-to-have nudge,
+            # never load-bearing - a failure here just means no worked
+            # examples this turn, same as a brand new connection.
+            example_context = ""
 
     # Prior turns as plain dicts (never ORM objects) - app.engine.rag never
     # sees a SQLAlchemy Message, satisfying the engine's isolation contract.
@@ -231,6 +243,10 @@ async def send_message(
         streamed_text = ""
         query_sql: Optional[str] = None
         chart_spec: Optional[Dict[str, Any]] = None
+        # Only a query that actually succeeded is worth remembering as a
+        # future few-shot example - a query that errored taught the model
+        # nothing correct to imitate. See the persist step below.
+        query_succeeded = False
 
         agen = stream_agentic_reply(
             user_id=user_id,
@@ -239,6 +255,7 @@ async def send_message(
             chat_history=history,
             message=question,
             schema_context=schema_context,
+            example_context=example_context,
         )
 
         # The generator handshake (see app/engine/__init__.py): driven with
@@ -281,6 +298,8 @@ async def send_message(
                             max_rows,
                             timeout_seconds,
                         )
+                        if to_send.get("ok"):
+                            query_succeeded = True
                         yield _sse(
                             "query_result",
                             {
@@ -313,6 +332,23 @@ async def send_message(
             yield _sse("error", {"message": str(exc)})
         finally:
             await agen.aclose()
+
+        if query_succeeded and query_sql and connection_id is not None:
+            # Capture this real, successful (question -> query) pair as a
+            # future few-shot example for this connection (see
+            # app/engine/example_rag.py) - best-effort, run off the request
+            # thread, and must never affect what the user already saw.
+            try:
+                await run_in_threadpool(
+                    example_rag.index_example,
+                    user_id,
+                    connection_id,
+                    engine_name or "",
+                    question,
+                    query_sql,
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
         content_to_persist = final_content or streamed_text
         if content_to_persist:
