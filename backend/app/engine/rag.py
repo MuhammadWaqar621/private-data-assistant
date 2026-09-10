@@ -58,7 +58,9 @@ app/engine/__init__.py. Read that before changing either side.
 import json
 from typing import Any, AsyncGenerator, Dict, List, Optional, Sequence, TypedDict
 
-from app.engine.llm_provider import get_active_chat_provider
+from openai import RateLimitError
+
+from app.engine.llm_provider import get_active_chat_provider, get_chat_model_chain
 
 # One completion per round. Three is exactly enough for the deepest useful
 # path - run_query, then render_chart, then the final written answer - and
@@ -455,10 +457,33 @@ async def stream_agentic_reply(
             request["tools"] = tools
             request["tool_choice"] = "auto"
 
-        try:
-            stream = await provider.client.chat.completions.create(**request)
-        except Exception as exc:  # noqa: BLE001
-            yield {"type": "error", "message": f"The AI provider failed: {exc}"}
+        stream = None
+        last_rate_limit_exc: Optional[Exception] = None
+        for model in await get_chat_model_chain(provider):
+            request["model"] = model
+            try:
+                stream = await provider.client.chat.completions.create(**request)
+                break
+            except RateLimitError as exc:
+                # This model's own quota is exhausted (Groq only - Azure
+                # never returns more than one model to try, see
+                # get_chat_model_chain) - try the next one in the chain
+                # immediately, no tokens have been streamed yet.
+                last_rate_limit_exc = exc
+                continue
+            except Exception as exc:  # noqa: BLE001 - a real failure, not a quota issue - stop here
+                yield {"type": "error", "message": f"The AI provider failed: {exc}"}
+                yield {
+                    "type": "done",
+                    "content": full_text,
+                    "query_sql": query_sql,
+                    "chart_spec": chart_spec,
+                }
+                return
+
+        if stream is None:
+            # Every model in the chain is rate-limited right now.
+            yield {"type": "error", "message": f"The AI provider failed: {last_rate_limit_exc}"}
             yield {
                 "type": "done",
                 "content": full_text,

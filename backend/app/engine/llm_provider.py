@@ -69,3 +69,18 @@ def get_active_chat_provider() -> ActiveChatProvider:
     return ActiveChatProvider(
         name="groq", client=groq_client.get_async_groq_chat_client(), model=config.model
     )
+
+
+async def get_chat_model_chain(provider: ActiveChatProvider) -> list[str]:
+    """Model ids to try, in order, for one chat-completion call.
+
+    Groq-only: Groq enforces quota per model independently, so on a
+    rate-limit error a different model can still succeed (see
+    groq_client.GROQ_FALLBACK_MODELS for why these specific ids and not
+    others). Azure OpenAI deployments don't have this per-model-swap
+    option - a deployment is a fixed resource, not one of several
+    interchangeable model ids - so Azure always returns just its own
+    single configured model, unchanged from today's behavior."""
+    if provider.name != "groq":
+        return [provider.model]
+    return await groq_client.live_groq_model_chain(provider.model, provider.client)
