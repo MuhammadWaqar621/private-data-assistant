@@ -2,6 +2,10 @@
 .env
 .env.*.local
 
+# Machine-local port remaps (e.g. avoiding a collision with another stack
+# already running on this machine) - not portable, never committed.
+docker-compose.override.yml
+
 # Node
 node_modules/
 dist/
