@@ -1,1 +1,55 @@
--r ../backend/requirements.txt
+# Duplicated from ../backend/requirements.txt - Vercel's Python builder
+# doesn't support pip's `-r ../other/requirements.txt` include syntax
+# (tried it, it fails to parse), so this has to be a real copy, not a
+# reference. Keep in sync manually when backend/requirements.txt changes.
+
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic[email]==2.10.4
+pydantic-settings==2.7.1
+sqlalchemy==2.0.36
+alembic==1.14.0
+# This app's OWN metadata database (users/chats/messages/connections) AND,
+# via the `vector` extension, its schema/example embeddings - see
+# app/engine/vector_store.py. pgvector-python adds the SQLAlchemy `Vector`
+# column type and query operators (cosine distance etc); it needs the
+# server-side `vector` extension enabled, which the Alembic migration
+# creates with `CREATE EXTENSION IF NOT EXISTS vector`.
+psycopg2-binary==2.9.10
+pgvector==0.3.6
+# Used for both Azure OpenAI (embeddings, always) and Groq (chat, via its
+# OpenAI-compatible API) - one SDK, two providers. See app/engine/.
+openai==1.59.6
+python-dotenv==1.2.2
+python-multipart==0.0.31
+
+# Auth: password hashing, JWT, forgot-password email
+# bcrypt is pinned <4.1: passlib 1.7.4's internal wrap-bug self-test
+# crashes with a hard ValueError on bcrypt>=4.1 (bcrypt 5.x confirmed
+# broken here) instead of the ValueError passlib expects to catch.
+passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
+python-jose[cryptography]==3.4.0
+httpx==0.28.1
+aiosmtplib==5.1.2
+
+# Credential encryption at rest (Fernet) for the passwords of the user's
+# registered databases - see app/core/crypto.py.
+cryptography==44.0.0
+
+# Drivers for the USER's databases (app/engine/db_adapters/). SQLite needs
+# no package - the adapter uses the stdlib `sqlite3` module, which also
+# gives it a genuine OS-level read-only open (mode=ro).
+#   - PyMySQL: pure Python, no libmysqlclient needed at build time.
+#   - pymssql: bundles FreeTDS in its wheel, so SQL Server support needs no
+#     system ODBC driver manager. See mssql_adapter.py for the tradeoff
+#     versus pyodbc.
+pymysql==1.1.1
+pymssql==2.3.2
+pymongo==4.10.1
+
+# Testing (backend/tests/): FastAPI's TestClient needs httpx (already
+# present above); pytest-asyncio backs the async engine tests
+# (test_rag.py's generator handshake).
+pytest==8.3.4
+pytest-asyncio==0.25.2
