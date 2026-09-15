@@ -17,23 +17,26 @@ leaves your database is the result of the specific query you asked for, and
 the only thing this application stores is your schema (as embeddings) plus
 the chat transcript.
 
-> **Status: complete end to end.** Connection registration, schema
-> introspection + embedding, retrieval, the agentic text-to-query loop,
-> read-only enforcement per engine, SSE streaming, charts, auth,
-> migrations and the test suite are implemented in `backend/`; the
-> React + TypeScript + Vite + Tailwind UI is in `frontend/`.
-> `docker-compose up` brings up Postgres, Qdrant, the API on
-> [:8000](http://localhost:8000/docs) and the UI on
+> **Status: complete end to end, and deployable entirely on Vercel.**
+> Connection registration, schema introspection + embedding, retrieval, the
+> agentic text-to-query loop, read-only enforcement per engine, SSE
+> streaming, charts, auth, migrations and the test suite are implemented in
+> `backend/`; the React + TypeScript + Vite + Tailwind UI is in `frontend/`.
+> For local development, `docker-compose up` brings up Postgres (with
+> pgvector), the API on [:8000](http://localhost:8000/docs) and the UI on
 > [:4173](http://localhost:4173). See "Getting started" for the full
-> walkthrough - in the UI, and with `curl` for the same steps.
+> walkthrough - in the UI, and with `curl` for the same steps - and
+> "Deploying to Vercel" for the one-Postgres-database, no-Docker production
+> shape.
 
 This is the sibling of
 [private-document-assistant](../private-document-assistant), and
 deliberately reuses its architecture (FastAPI, SQLAlchemy + Alembic, JWT
-auth, Postgres for metadata, Qdrant for vectors, SSE streaming, an isolated
-`engine/` package, provider-selectable LLM, a `GET /api/config/status`
-gating pattern). The domain is what changed: **schema-RAG + text-to-query
-against live databases** instead of document RAG.
+auth, Postgres for metadata, pgvector for vectors, SSE streaming, an
+isolated `engine/` package, provider-selectable LLM, a
+`GET /api/config/status` gating pattern). The domain is what changed:
+**schema-RAG + text-to-query against live databases** instead of document
+RAG.
 
 ---
 
@@ -48,7 +51,8 @@ against live databases** instead of document RAG.
 7. [API reference](#api-reference)
 8. [Environment variables](#environment-variables)
 9. [Running tests](#running-tests)
-10. [Roadmap / known tradeoffs](#roadmap--known-tradeoffs)
+10. [Deploying to Vercel](#deploying-to-vercel)
+11. [Roadmap / known tradeoffs](#roadmap--known-tradeoffs)
 
 ---
 
@@ -60,17 +64,18 @@ flowchart TB
         FE["Frontend · frontend/<br/>React 18 + Vite + TypeScript + Tailwind<br/>chat shell · per-chat database selector<br/>manual SSE reader · Chart.js"]
     end
 
-    subgraph Backend["Backend - FastAPI"]
+    subgraph Backend["Backend - FastAPI (a Vercel serverless Python function)"]
         API["API layer · app/api/*.py<br/>auth · ownership checks · credential encrypt/decrypt<br/>DB persistence · SSE streaming<br/>the ONLY place a query is executed"]
         subgraph ENGINE["engine/ package - zero imports from api/models/auth"]
             ADAPT["db_adapters/<br/>postgres · mysql · mssql · sqlite · mongodb<br/>test_connection · introspect_schema · execute_read_only<br/>readonly.py: the guard (pure functions)"]
             SRAG["schema_rag.py<br/>chunk per table · embed · upsert<br/>search filtered by user_id AND connection_id"]
             RAG["rag.py<br/>agentic loop · run_query + render_chart tools<br/>yields tool_call, caller executes it"]
+            BLOB["blob_storage.py<br/>uploaded SQLite files, since a serverless<br/>function has no persistent disk"]
         end
     end
 
-    PG[("Postgres - THIS app's metadata<br/>users · chats · messages<br/>database_connections<br/>(no user business data, ever)")]
-    QD[("Qdrant<br/>one vector per TABLE SCHEMA<br/>every point tagged<br/>user_id + connection_id")]
+    PG[("Vercel Postgres (Neon)<br/>THIS app's metadata: users · chats ·<br/>messages · database_connections<br/>PLUS pgvector: schema_chunks +<br/>example_chunks (one Postgres database, no<br/>separate vector service)")]
+    VB[("Vercel Blob<br/>uploaded SQLite database files<br/>{user_id}/{connection_id}/database.sqlite")]
     USERDB[("The USER's own database<br/>Postgres / MySQL / MSSQL /<br/>SQLite / MongoDB<br/>READ-ONLY, never modified")]
     AZ["Azure OpenAI<br/>embeddings (always) +<br/>chat (if LLM_PROVIDER=azure)"]
     GQ["Groq<br/>chat completions<br/>(if LLM_PROVIDER=groq, default)"]
@@ -80,18 +85,19 @@ flowchart TB
     API -- "SQLAlchemy" --> PG
     API -- "executes the model's query<br/>via get_adapter(engine)" --> ADAPT
     ADAPT -- "SELECT only, in a transaction<br/>that is always rolled back" --> USERDB
-    SRAG -- "upsert / search,<br/>always filtered by<br/>user_id AND connection_id" --> QD
+    BLOB -- "PUT / GET / delete" --> VB
+    SRAG -- "upsert / search (cosine distance),<br/>always filtered by<br/>user_id AND connection_id" --> PG
     SRAG -- "embeddings" --> AZ
     RAG -- "streamed chat completions" --> GQ
     RAG -- "streamed chat completions" --> AZ
 ```
 
-Three storage systems, three completely different jobs:
+Storage, and who writes it:
 
 | | What it holds | Who writes it |
 |---|---|---|
-| **Postgres** (this app's) | users, chats, messages, and the *registration record* for each database you connect (host, port, database name, username, **encrypted** password, indexing status) | this app |
-| **Qdrant** | one embedded chunk per **table**, tagged `user_id` + `connection_id` + `engine`. Column names, types, keys, and up to 5 sample rows | this app |
+| **Postgres** (Vercel Postgres/Neon) | users, chats, messages, the *registration record* for each database you connect (host, port, database name, username, **encrypted** password, indexing status) - AND, via pgvector, one embedded chunk per **table** (`schema_chunks`) and one per few-shot example (`example_chunks`), each tagged `user_id` + `connection_id` + `engine` | this app |
+| **Vercel Blob** | uploaded SQLite database files, at `{user_id}/{connection_id}/database.sqlite` | this app |
 | **Your database** | your actual data | **you** - this app only ever reads it |
 
 The only copy of your data that this application ever holds is (a) up to
@@ -102,8 +108,11 @@ history re-renders it.
 
 ### Components
 
-- **Backend** - Python 3.11+, FastAPI, SQLAlchemy + Alembic, Postgres for
-  its own relational data, Qdrant for schema vectors. Embeddings always go
+- **Backend** - Python 3.11+, FastAPI (deployed as a single Vercel
+  serverless Python function - see "Deploying to Vercel"), SQLAlchemy +
+  Alembic, one Postgres database (Vercel Postgres/Neon) for both its own
+  relational data AND schema/example vectors via the `vector` extension
+  (pgvector) - see `app/engine/vector_store.py`. Embeddings always go
   through **Azure OpenAI** (`openai.AzureOpenAI`); **chat completions** are
   provider-selectable via `LLM_PROVIDER` (`groq`, the default, or `azure`)
   - Groq's API is OpenAI-compatible, so the same `openai` package serves
@@ -192,9 +201,9 @@ POST /api/connections            ->  row created, status=pending
    |-- azure embeddings  ->  one vector per chunk
    |
    |-- schema_rag.index_connection_schema(...)
-   |        upsert into Qdrant, EVERY point tagged
-   |        {user_id, connection_id, engine, table_name, text}
-   |        (old points for this connection are deleted first)
+   |        upsert into the schema_chunks table (Postgres + pgvector),
+   |        EVERY row tagged {user_id, connection_id, engine, table_name, text}
+   |        (old rows for this connection are deleted first)
    |
    |-- example_rag.seed_fk_join_examples(...)      best-effort, non-fatal
    |        one worked (question, query) example PER FOREIGN KEY,
@@ -203,9 +212,9 @@ POST /api/connections            ->  row created, status=pending
    |        "list each <child> together with its related <parent>", with
    |        the literal correct JOIN already written using the real
    |        PK/FK column names (a $lookup aggregate for MongoDB). Capped
-   |        at 12 examples; upserted into a SECOND Qdrant collection
-   |        (private_data_assistant_examples), same {user_id,
-   |        connection_id} tagging as the schema collection.
+   |        at 12 examples; upserted into a SECOND table
+   |        (example_chunks), same {user_id, connection_id} tagging as
+   |        the schema_chunks table.
    |
    `-- status=ready, schema_indexed_at=now
 ```
@@ -228,10 +237,12 @@ conversation, to any of your `ready` connections.
 
 **1. You POST the connection details.** Network engines
 (`postgres`/`mysql`/`mssql`/`mongodb`) send JSON; SQLite uploads the
-database file to `POST /api/connections/sqlite` instead, which stores it at
-`storage/{user_id}/{connection_id}/database.sqlite`. The password is
-encrypted with Fernet *before* the row is written -
-[see below](#credential-handling).
+database file to `POST /api/connections/sqlite` instead, which uploads it
+to Vercel Blob at `{user_id}/{connection_id}/database.sqlite` (see
+`app/engine/blob_storage.py` - a Vercel serverless function has no
+persistent disk, so the file can't just live on "the" filesystem the way
+it would under docker-compose). The password is encrypted with Fernet
+*before* the row is written - [see below](#credential-handling).
 
 **2. The connection is tested for real.** `test_connection()` opens an
 actual connection and runs `SELECT 1` (or a Mongo `ping` against your
@@ -272,11 +283,12 @@ The sample rows earn their place: they show the model that `status` is
 an epoch integer, that money is in units and not cents. That is most of the
 difference between a query that runs and one that returns zero rows.
 
-**5. Everything is upserted into Qdrant**, each point carrying `user_id`,
-`connection_id`, `engine` and `table_name` in its payload. The point id is
-a deterministic UUID of `(user_id, connection_id, table_name)`, so
-re-indexing overwrites rather than accumulating, and two users whose
-connection #5 both have an `orders` table get two distinct points.
+**5. Everything is upserted into the `schema_chunks` table** (Postgres +
+pgvector - see `app/engine/vector_store.py`), each row carrying `user_id`,
+`connection_id`, `engine` and `table_name`. The row id is a deterministic
+UUID of `(user_id, connection_id, table_name)`, so re-indexing overwrites
+rather than accumulating, and two users whose connection #5 both have an
+`orders` table get two distinct rows.
 
 The row flips to `status: "ready"` with `schema_indexed_at` set. All of
 this happens **synchronously, inside the request** - a deliberate tradeoff,
@@ -294,13 +306,14 @@ POST /api/chats/{id}/messages  {"content": "revenue by country?"}
    |
    |-- schema_rag.retrieve_relevant_schema(user_id, connection_id, question)
    |        embed the question (Azure)
-   |        search Qdrant with must-filters on user_id AND connection_id
+   |        search schema_chunks (cosine distance) filtered by
+   |        user_id AND connection_id
    |        -> the top-8 matching table chunks, joined into one string
-   |        (Qdrant only - your database is NOT touched here)
+   |        (Postgres/pgvector only - your database is NOT touched here)
    |
    |-- example_rag.retrieve_relevant_examples(user_id, connection_id, question)
-   |        same embed + must-filter search, against the SECOND Qdrant
-   |        collection - the top-3 most similar past (question, query)
+   |        same embed + filtered search, against the SECOND table
+   |        (example_chunks) - the top-3 most similar past (question, query)
    |        pairs for this connection (seeded FK examples and/or real
    |        past turns), or "" if nothing is indexed yet
    |
@@ -528,10 +541,15 @@ lock.
 
 ### SQLite (stdlib `sqlite3`, on an uploaded file)
 
-The one engine with no server: you upload the file, and it's stored at
-`storage/{user_id}/{connection_id}/database.sqlite`. That path is built
-server-side from the authenticated user id and the row's own id - **never**
-from the uploaded filename - so there is no path-traversal surface.
+The one engine with no server: you upload the file, and it's stored in
+Vercel Blob at `{user_id}/{connection_id}/database.sqlite` (see
+`app/engine/blob_storage.py`). That pathname is built server-side from the
+authenticated user id and the row's own id - **never** from the uploaded
+filename - so there is no path-traversal surface. Every query
+**downloads the blob to a fresh temp file** first (a Vercel serverless
+function has no persistent disk - the only writable location is `/tmp`),
+operates on that local copy, and removes it afterwards regardless of
+outcome.
 
 - The file is opened through a URI with **`mode=ro`**. SQLite itself
   refuses every write at the C level: an `ATTACH`, a `PRAGMA
@@ -734,9 +752,10 @@ guess:
 docker-compose up --build
 ```
 
-`postgres` (this app's metadata), `qdrant`, `backend` on
-http://localhost:8000, and `frontend` on http://localhost:4173.
-**No target databases** - those are yours; see
+`postgres` (this app's metadata AND, via pgvector, its schema/example
+embeddings - the image is `pgvector/pgvector`, not plain `postgres`),
+`backend` on http://localhost:8000, and `frontend` on
+http://localhost:4173. **No target databases** - those are yours; see
 [docs/testing-with-a-sample-database.md](docs/testing-with-a-sample-database.md)
 to spin up a throwaway one.
 
@@ -971,7 +990,6 @@ curl -N -X POST http://localhost:8000/api/chats/1/messages \
 - Health check: http://localhost:8000/health
 - Config status: http://localhost:8000/api/config/status
 - Interactive API docs: http://localhost:8000/docs
-- Qdrant dashboard: http://localhost:6333/dashboard
 
 ### Running the backend without Docker
 
@@ -1009,12 +1027,12 @@ ownership can't be distinguished from non-existence.
 | Endpoint | Notes |
 |---|---|
 | `POST /api/connections` | JSON body for `postgres`/`mysql`/`mssql`/`mongodb`: `{name, engine, host, port, database_name, username, password, extra_params}`. Encrypts the password, creates the row `status=pending`, then synchronously tests -> introspects -> indexes, returning the row as `ready` or `failed`. **503** `encryption_not_configured` / `ai_not_configured`. **Never 500s** - a failure is a `failed` row. Rejects `engine=sqlite` and points at the route below. |
-| `POST /api/connections/sqlite` | multipart (`file`, `name`) - stores the upload at `storage/{user_id}/{connection_id}/database.sqlite` and runs the same pipeline. (Two routes rather than one because a single FastAPI route can't cleanly describe both a JSON body and a multipart upload - see `connections.py`.) |
+| `POST /api/connections/sqlite` | multipart (`file`, `name`) - uploads the file to Vercel Blob at `{user_id}/{connection_id}/database.sqlite` and runs the same pipeline. (Two routes rather than one because a single FastAPI route can't cleanly describe both a JSON body and a multipart upload - see `connections.py`.) |
 | `GET /api/connections` | the caller's connections, newest first |
 | `GET /api/connections/{id}` | one connection |
 | `POST /api/connections/{id}/test` | re-runs only the connectivity check -> `{ok, error}`. Deliberately does **not** change `status`: a momentarily-unreachable database shouldn't demote a `ready` connection. |
-| `POST /api/connections/{id}/reindex` | deletes the old Qdrant points and re-introspects + re-embeds, so a dropped table disappears from the index |
-| `DELETE /api/connections/{id}` | deletes the row, its Qdrant points, and (for SQLite) the stored file. Chats that used it keep their transcript but are unbound (`ON DELETE SET NULL`). |
+| `POST /api/connections/{id}/reindex` | deletes the old schema_chunks/example_chunks rows and re-introspects + re-embeds, so a dropped table disappears from the index |
+| `DELETE /api/connections/{id}` | deletes the row, its schema_chunks/example_chunks rows, and (for SQLite) the stored blob. Chats that used it keep their transcript but are unbound (`ON DELETE SET NULL`). |
 
 No response from any of these contains the password in any form.
 
@@ -1032,7 +1050,7 @@ No response from any of these contains the password in any form.
 
 | Endpoint | Notes |
 |---|---|
-| `POST /api/chats/{chat_id}/messages` | `{content}` - that's the entire body; there is nothing in it that can influence which database is queried. Persists the user message, retrieves schema context from Qdrant, and streams the reply as SSE. Persists the assistant message with `content` + `query_sql` + `chart_spec` when the turn finishes. **404** if the chat (or its connection) isn't yours; **503** if AI isn't configured; **400** for empty content. |
+| `POST /api/chats/{chat_id}/messages` | `{content}` - that's the entire body; there is nothing in it that can influence which database is queried. Persists the user message, retrieves schema context from the schema_chunks table, and streams the reply as SSE. Persists the assistant message with `content` + `query_sql` + `chart_spec` when the turn finishes. **404** if the chat (or its connection) isn't yours; **503** if AI isn't configured; **400** for empty content. |
 
 SSE event types: `token` (`{content}`), `query` (`{query}` - the query
 about to run), `query_result` (`{ok, row_count, error}`), `chart`
@@ -1068,14 +1086,10 @@ the app. Either way the values come from the same file - docker-compose's
 
 | Variable | Purpose | Required |
 |---|---|---|
-| `DATABASE_URL` | Postgres connection string for **this app's own** metadata database | Yes |
-| `QDRANT_URL` | Qdrant base URL (local container or Qdrant Cloud) | Yes |
-| `QDRANT_API_KEY` | Qdrant Cloud API key (blank for the local container) | Optional |
-| `QDRANT_COLLECTION` | Collection holding schema vectors | Optional (default `private_data_assistant_schema`) |
-| `QDRANT_EXAMPLES_COLLECTION` | Collection holding few-shot (question -> query) example vectors | Optional (default `private_data_assistant_examples`) |
+| `DATABASE_URL` | Postgres connection string for **this app's own** metadata database, AND (via pgvector) its schema/example embeddings. Local docker-compose: the `postgres` service. Vercel: the connection string Vercel Postgres gives you when you provision it | Yes |
+| `BLOB_READ_WRITE_TOKEN` | Vercel Blob token for uploaded SQLite database files (see `app/engine/blob_storage.py`) - the env var name Vercel itself assigns when you provision a Blob store and connect it to a project | Yes, for SQLite connections |
 | `FRONTEND_URL` | Used to build password-reset links | Yes |
-| `VITE_API_BASE_URL` | Read by docker-compose as a **build arg** for the frontend image (Vite inlines `VITE_*` at build time) | Yes, for the compose frontend build |
-| `STORAGE_DIR` | Where uploaded SQLite files go, as `{STORAGE_DIR}/{user_id}/{connection_id}/database.sqlite` | Optional (default `storage`) |
+| `VITE_API_BASE_URL` | Local docker-compose: read as a **build arg** for the frontend image (Vite inlines `VITE_*` at build time). On Vercel: a plain Environment Variable on the **frontend** project, pointed at the backend project's URL | Yes |
 | `ENCRYPTION_KEY` | Fernet key encrypting registered databases' passwords. Generate: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` | **Yes** - no connection can be registered without it |
 | `MAX_QUERY_ROWS` | Row cap on every query the assistant runs | Optional (default `200`) |
 | `QUERY_TIMEOUT_SECONDS` | Statement timeout on every query | Optional (default `15`) |
@@ -1083,7 +1097,7 @@ the app. Either way the values come from the same file - docker-compose's
 | `AZURE_EM_API_KEY` | Embeddings API key | Yes |
 | `AZURE_EM_API_VERSION` | Embeddings API version | Yes |
 | `AZURE_EM_MODEL` | Embeddings deployment name | Yes |
-| `AZURE_EM_DIMENSIONS` | Vector size, sizes the Qdrant collection | Optional (default `1536` in code) |
+| `AZURE_EM_DIMENSIONS` | Vector size, sizes the pgvector columns (see `app/engine/vector_store.py` and the Alembic migration that creates them) | Optional (default `1536` in code) |
 | `LLM_PROVIDER` | Which provider serves **chat** - `groq` (default) or `azure`. Embeddings are always Azure. | Optional |
 | `GROQ_API_KEY` | Groq key - needed when `LLM_PROVIDER=groq` | Optional |
 | `GROQ_LLM_MODEL` | Groq chat model | Optional (default `openai/gpt-oss-120b`) |
@@ -1105,40 +1119,129 @@ the app. Either way the values come from the same file - docker-compose's
 docker-compose exec backend pytest tests/ -v
 ```
 
-Or from the host, pointing the Qdrant tests at the published port (the
-hostname `qdrant` only resolves inside the docker network):
+Or from the host, pointing the pgvector isolation tests at a real
+Postgres+pgvector instance (they SKIP cleanly, rather than failing the
+whole suite, if none is reachable - see below):
 
 ```bash
 cd backend
 pip install -r requirements.txt
-QDRANT_TEST_URL=http://localhost:6333 pytest tests/ -v
+TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/private_data_assistant pytest tests/ -v
 ```
 
 | File | Covers |
 |---|---|
-| `test_schema_qdrant_isolation.py` | **The most important file here.** `schema_rag`'s search isolation against a **real** (disposable, uniquely-named) Qdrant collection: a `user_id` mismatch returns nothing *even when `connection_id` matches*; a `connection_id` mismatch returns nothing *even when `user_id` matches*; two users reusing the same numeric `connection_id` never leak into each other (in both directions, including when queried with the *other* user's exact vector, proving the filter and not similarity decides); identically-named tables across users don't overwrite each other; one user's two connections never bleed; deletion is scoped by both ids; re-indexing overwrites rather than duplicating. Plus the chunk renderer (columns, PK/FK markers, sample-row table, truncation). |
+| `test_pgvector_isolation.py` | **The most important file here.** `schema_rag`'s search isolation against a **real** Postgres+pgvector instance, using a disposable, uniquely-named Postgres SCHEMA per test (never the real `public` schema): a `user_id` mismatch returns nothing *even when `connection_id` matches*; a `connection_id` mismatch returns nothing *even when `user_id` matches*; two users reusing the same numeric `connection_id` never leak into each other (in both directions, including when queried with the *other* user's exact vector, proving the filter and not similarity decides); identically-named tables across users don't overwrite each other; one user's two connections never bleed; deletion is scoped by both ids; re-indexing overwrites rather than duplicating. Plus the chunk renderer (columns, PK/FK markers, sample-row table, truncation). **Skips entirely** (not a failure) if `TEST_DATABASE_URL`/`DATABASE_URL` doesn't point at a reachable Postgres with permission to `CREATE EXTENSION vector` and `CREATE SCHEMA`. |
 | `test_db_adapters_readonly.py` | The read-only guard as pure functions - `SELECT`/`WITH` pass; every blocklisted keyword is rejected as a standalone token *and* not falsely matched inside `updated_at`/`dropoff_rate`; keywords inside string literals and quoted identifiers are fine; multi-statement strings are rejected including behind a comment; MSSQL `TOP`-wrapping vs Postgres/MySQL/SQLite `LIMIT`-wrapping, and MSSQL declining to wrap a CTE or an ORDER BY; the whole MongoDB spec guard (four allowed operations, five blocked operators including `$where` nested in a filter, limit clamping and `$limit` injection). Plus the SQLite adapter end-to-end against a real temp database: rows, row cap, guard rejection, `mode=ro` refusing a write even when the guard is bypassed, PK/FK/sample introspection, and a missing file reported rather than raised. |
 | `test_rag.py` | The agentic loop and the generator handshake with a mocked provider - a greeting never runs a query; the first call carries the system prompt, schema context and both tools; no connection means no tools are offered at all; a tool round-trip passes exactly the `user_id`/`connection_id`/`engine_name` the caller supplied (proving the model can't override them); rows/failures/truncation/empty results are fed back correctly; `render_chart` uses the held rows and **ignores** data the model tries to smuggle into its arguments; the final round is issued with no tools so the loop terminates; dialect hints; a provider failure becomes an `error` event rather than an exception. |
 | `test_messages_api.py` | The endpoint that executes queries - the isolation invariant (extra fields in the request body can't redirect the query; the executor gets the endpoint's own engine and freshly-decrypted credentials, not the ids echoed in the event), SSE plumbing, chart + `query_sql` persistence and reload, the no-connection path, auto-titling, and the 503/404/400 gates. |
-| `test_connections_api.py` | Ownership, and the credential rules - the password never appears in any response and no such field exists in the schema; it is stored encrypted, round-trips, and is what reaches the adapter; the `pending -> indexing -> ready/failed` machine for connect failures, introspection failures, indexing failures and an empty database; validation; the SQLite upload path and its server-derived storage path; test/reindex/delete behavior. Adapters and indexing are mocked, so no real database is needed. |
+| `test_connections_api.py` | Ownership, and the credential rules - the password never appears in any response and no such field exists in the schema; it is stored encrypted, round-trips, and is what reaches the adapter; the `pending -> indexing -> ready/failed` machine for connect failures, introspection failures, indexing failures and an empty database; validation; the SQLite upload path against a mocked Vercel Blob (see the `fake_blob` fixture); test/reindex/delete behavior. Adapters and indexing are mocked, so no real database is needed. |
 | `test_chats_api.py` | CRUD, ownership 404s, and the connection binding - set, change, clear with an explicit null, leave alone when omitted, and 404 when binding to another user's connection. |
 | `test_auth_api.py` | `/api/auth/*` - signup/duplicate/password policy, login, refresh-token type confusion, and the `jwt_not_configured`/`smtp_not_configured` 503 gates. |
 | `test_config_status.py` | The provider-aware `connections_llm` group (never both providers at once, `AZURE_EM_DIMENSIONS` not required), the `encryption` group including a malformed key reporting `false`, `smtp`, and `llm_provider` defaulting. |
 
 **Test database choice:** the integration tests run against an in-memory
-SQLite database via a `get_db` dependency override, not the docker-compose
-Postgres - nothing they exercise depends on Postgres-specific behavior, and
-a fresh zero-setup schema per test makes "this row must not be visible to
-that user" trivial to reason about. Full rationale in
+SQLite database via a `get_db` dependency override, not a real Postgres -
+nothing they exercise depends on Postgres-specific behavior, and a fresh
+zero-setup schema per test makes "this row must not be visible to that
+user" trivial to reason about. Full rationale in
 `backend/tests/conftest.py`'s module docstring. This is not a substitute
 for `alembic upgrade head` against real Postgres.
 
-`test_schema_qdrant_isolation.py` is the deliberate exception: Qdrant's
-payload filtering is the single property this whole product's multi-tenancy
-rests on, so it is tested against a real Qdrant instance. And
-`test_db_adapters_readonly.py` needs no server at all, by design -
-`readonly.py` imports nothing but the standard library precisely so the
-security-critical logic can be unit-tested anywhere.
+`test_pgvector_isolation.py` is the deliberate exception: pgvector's
+row-level filtering is the single property this whole product's
+multi-tenancy rests on, so it is tested against a real Postgres+pgvector
+instance (and skips cleanly, rather than failing the suite, without one -
+see the file's own docstring). And `test_db_adapters_readonly.py` needs no
+server at all, by design - `readonly.py` imports nothing but the standard
+library precisely so the security-critical logic can be unit-tested
+anywhere.
+
+---
+
+## Deploying to Vercel
+
+Everything in this project runs on Vercel's own products - no AWS, no
+separate Neon/Qdrant Cloud account to manage yourself, no Docker in
+production. Two Vercel projects, both pointed at this one repo:
+
+| Vercel project | Root Directory | What it deploys |
+|---|---|---|
+| Backend | `backend` | The FastAPI app as a single Python serverless function (`backend/api/index.py`, routed by `backend/vercel.json`) |
+| Frontend | `frontend` | The static Vite build, with an SPA rewrite (`frontend/vercel.json`) so client-side routes (`/login`, `/app`, ...) don't 404 on a hard refresh |
+
+### 1. Provision storage first
+
+In the **backend** project (or any project in the same Vercel team/account
+- storage is account-scoped, not project-scoped):
+
+1. **Storage -> Postgres** - create a database. This is Vercel Postgres
+   (Neon-backed) and is the ONLY database this deployment needs: it holds
+   this app's own metadata (users/chats/messages/connections) AND, via the
+   `vector` extension, the schema/example embeddings that a separate
+   Qdrant service used to hold (see `app/engine/vector_store.py`). Connect
+   it to the backend project - Vercel sets `DATABASE_URL` (and a pooled
+   variant) automatically as a project env var.
+2. **Storage -> Blob** - create a store and connect it to the backend
+   project. Vercel sets `BLOB_READ_WRITE_TOKEN` automatically - this is
+   where uploaded SQLite database files go (see
+   `app/engine/blob_storage.py`), since a serverless function has no
+   persistent disk.
+
+### 2. Run the migration once, out-of-band
+
+Alembic migrations do **not** run inside the serverless function (there is
+no "on deploy" hook for that, and a cold start is the wrong place to race
+multiple instances through a schema change). From your own machine, with
+the DATABASE_URL Vercel just gave you (the **non-pooled** / direct
+connection string - migrations want a plain session, not a pooled one):
+
+```bash
+cd backend
+pip install -r requirements.txt
+DATABASE_URL="<paste the Vercel Postgres connection string>" alembic upgrade head
+```
+
+This creates every table, including `schema_chunks`/`example_chunks` and
+the `vector` extension itself (`CREATE EXTENSION IF NOT EXISTS vector` -
+Neon supports this without superuser access). Re-run this after pulling
+any future migration, the same way you would against docker-compose's
+Postgres.
+
+### 3. Set the remaining environment variables
+
+On the **backend** Vercel project (Settings -> Environment Variables), set
+everything from the [Environment variables](#environment-variables) table
+above except `DATABASE_URL` and `BLOB_READ_WRITE_TOKEN` (Vercel already set
+those in step 1): `FRONTEND_URL` (the frontend project's URL, once you
+know it), `ENCRYPTION_KEY`, `JWT_SECRET_KEY`, `AZURE_EM_*`, `LLM_PROVIDER`
++ its provider's credentials, and SMTP if you want forgot-password email.
+
+On the **frontend** Vercel project, set `VITE_API_BASE_URL` to the backend
+project's URL (Vite inlines it at build time, so redeploy the frontend if
+this changes).
+
+### 4. Deploy
+
+Push to the branch each Vercel project is connected to (or use the Vercel
+CLI/dashboard's manual deploy). Vercel's zero-config Vite preset builds the
+frontend; the backend project auto-detects `api/index.py`'s ASGI `app` and
+builds the Python function per `backend/vercel.json`. No Dockerfile is used
+for either project on Vercel (`backend/Dockerfile` and `frontend/Dockerfile`
+remain only for local docker-compose).
+
+### What's different from local docker-compose
+
+- **No Qdrant** - schema/example vectors live in the same Postgres database
+  via pgvector (see "Architecture" above).
+- **No local filesystem storage** - uploaded SQLite files go to Vercel Blob.
+- **No long-lived container** - every request is a fresh (or warmed) 
+  serverless function invocation; nothing in `app/` relies on in-process
+  state surviving between requests (the one thing that used to - the
+  local SQLite file on disk - now round-trips through Blob every time, see
+  `app/engine/db_adapters/sqlite_adapter.py`).
+- **Migrations are out-of-band**, never run at import time or on a cold
+  start (see step 2 above).
 
 ---
 
@@ -1167,12 +1270,16 @@ production version would do instead.
 - **Schema indexing is synchronous**, inside the registration request -
   the simplest thing that works, and a database with a few dozen tables
   indexes in seconds. A large schema (hundreds of tables) will make that
-  request slow. Production would push it onto a background worker (Celery,
-  RQ, arq) behind a queue, return immediately with `status=indexing`, and
-  let the client poll `GET /api/connections` until it flips. Everything
-  else about the pipeline already works the way it would in that design -
-  the status machine exists precisely so this can be swapped without
-  changing the API contract.
+  request slow, and on Vercel it must also finish inside the function's
+  `maxDuration` (`backend/vercel.json`, currently 60s) - there is no
+  request-scoped background work on a serverless platform the way a
+  long-running docker-compose container has. Production would push it onto
+  a background worker (Celery, RQ, arq, or a Vercel-native queue/cron)
+  behind a queue, return immediately with `status=indexing`, and let the
+  client poll `GET /api/connections` until it flips. Everything else about
+  the pipeline already works the way it would in that design - the status
+  machine exists precisely so this can be swapped without changing the API
+  contract.
 - **No query result caching.** Every question re-runs its query. Fine for
   interactive use; a busy deployment would want a short-lived cache keyed
   on (connection, query text).
@@ -1189,8 +1296,15 @@ production version would do instead.
   inside a single long C call can overrun.
 - **`REPLACE` is over-blocked** - the string function is refused along with
   `REPLACE INTO`.
-- **Deployment hardening.** This targets local docker-compose. A real
-  deployment also needs CORS tightened from `allow_origins=["*"]`, HTTPS
-  termination, a secrets manager instead of `.env`, per-user rate limits on
-  query execution, and an audit log of executed queries beyond
+- **Deployment hardening.** `docker-compose` (local dev) and Vercel
+  (production - see "Deploying to Vercel") are both covered, but CORS is
+  still `allow_origins=["*"]`, there is no secrets manager beyond Vercel's
+  own encrypted project env vars, no per-user rate limits on query
+  execution, and no audit log of executed queries beyond
   `messages.query_sql`.
+- **Vercel Postgres connection limits.** Vercel Postgres (Neon) offers both
+  a direct connection string and a pooled ("-pooler") one; a serverless
+  function can burst to many concurrent instances, each opening its own
+  connection, so the pooled connection string is the one to put in
+  `DATABASE_URL` for production (the direct one is fine for running
+  `alembic upgrade head` from a single local machine).

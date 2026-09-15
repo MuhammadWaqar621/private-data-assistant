@@ -35,7 +35,7 @@ Modules:
                        interface: test_connection / introspect_schema /
                        execute_read_only. Read-only enforcement lives in
                        db_adapters/readonly.py (pure functions, stdlib only)
-  - schema_rag.py:    schema chunking, embedding, Qdrant storage/search,
+  - schema_rag.py:    schema chunking, embedding, pgvector storage/search,
                        with per-(user_id, connection_id) isolation enforced
                        unconditionally on every search
   - rag.py:           the agentic text-to-query loop (stream_agentic_reply)

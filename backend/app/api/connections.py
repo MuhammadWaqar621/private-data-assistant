@@ -36,8 +36,8 @@ handles the file upload.
 
 import os
 import shutil
+import tempfile
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
@@ -53,7 +53,7 @@ from app.core.crypto import (
     decrypt_secret,
 )
 from app.db.session import get_db
-from app.engine import example_rag, schema_rag
+from app.engine import blob_storage, example_rag, schema_rag
 from app.engine.azure_client import ai_configured
 from app.engine.db_adapters import get_adapter
 from app.engine.db_adapters.base import ConnectionInfo
@@ -61,13 +61,6 @@ from app.engine.llm_provider import get_llm_provider_name
 from app.models import ConnectionStatus, DatabaseConnection, DatabaseEngine, User
 
 router = APIRouter(prefix="/api/connections", tags=["connections"])
-
-# Where uploaded SQLite databases live on disk:
-# storage/{user_id}/{connection_id}/database.sqlite - mirroring the sibling
-# project's storage/{user_id}/{document_id}/original.<ext> convention.
-# "storage" is gitignored and, under docker-compose, lives inside the
-# bind-mounted ./backend directory so it survives container restarts.
-STORAGE_ROOT = Path(os.getenv("STORAGE_DIR", "storage"))
 
 SQLITE_FILENAME = "database.sqlite"
 
@@ -234,7 +227,7 @@ def provision_connection(db: Session, connection: DatabaseConnection) -> Databas
     """test -> introspect -> embed -> ready/failed, synchronously.
 
     Never raises: every failure mode (bad credentials, unreachable host,
-    an undecryptable password after a key rotation, an embedding or Qdrant
+    an undecryptable password after a key rotation, an embedding or Postgres/pgvector
     outage) is recorded on the row as `status=failed` with a message the
     user can act on."""
     connection.status = ConnectionStatus.indexing
@@ -289,7 +282,7 @@ def provision_connection(db: Session, connection: DatabaseConnection) -> Databas
     # just indexed above. Best-effort and non-fatal on purpose - unlike
     # schema indexing, a connection is still fully usable with zero
     # examples (the model just has one less nudge on its first question),
-    # so a Qdrant hiccup here must never flip a `ready` connection to
+    # so a storage hiccup here must never flip a `ready` connection to
     # `failed`. Cleared first for the same re-index reason as the schema.
     try:
         example_rag.delete_connection_examples(connection.user_id, connection.id)
@@ -330,7 +323,7 @@ def _reject_if_duplicate(
     the same database and must both be registerable. It is deliberately
     NOT scoped to username/password - the same physical database
     registered under two different credentials is still the same
-    database, and letting it in twice would just mean asking Qdrant to
+    database, and letting it in twice would just mean asking the schema index to
     index (and the model to search) the identical schema under two
     different connection_ids for no benefit."""
     existing = (
@@ -356,13 +349,15 @@ def _reject_if_duplicate(
             )
 
 
-def _sqlite_dir(user_id: int, connection_id: int) -> Path:
-    """The server-derived storage directory for one uploaded database.
+def _sqlite_blob_pathname(user_id: int, connection_id: int) -> str:
+    """The server-derived Vercel Blob pathname for one uploaded database.
 
     Built from the AUTHENTICATED user id and the row's own id - never from
     the uploaded filename or any other client input, so there is no path
-    traversal surface here at all."""
-    return STORAGE_ROOT / str(user_id) / str(connection_id)
+    traversal surface here at all. Mirrors the local-filesystem convention
+    this project used before moving to Blob storage:
+    {user_id}/{connection_id}/database.sqlite."""
+    return f"{user_id}/{connection_id}/{SQLITE_FILENAME}"
 
 
 # --- Endpoints -----------------------------------------------------------------
@@ -420,10 +415,12 @@ def create_sqlite_connection(
 ) -> DatabaseConnection:
     """Register a SQLite database by uploading its file.
 
-    The file is stored at storage/{user_id}/{connection_id}/database.sqlite
-    and that path is recorded in `extra_params["storage_path"]`. There is
-    no host, port, username or password - which is why the JSON endpoint
-    above rejects `engine=sqlite` and points here."""
+    The file is uploaded to Vercel Blob at
+    {user_id}/{connection_id}/database.sqlite (see app/engine/blob_storage.py)
+    and the blob's public URL is recorded in
+    `extra_params["storage_url"]`. There is no host, port, username or
+    password - which is why the JSON endpoint above rejects `engine=sqlite`
+    and points here."""
     _require_encryption_configured()
     _require_ai_configured()
 
@@ -451,21 +448,30 @@ def create_sqlite_connection(
     db.commit()
     db.refresh(connection)
 
-    target_dir = _sqlite_dir(current_user.id, connection.id)
-    target_dir.mkdir(parents=True, exist_ok=True)
-    target_path = target_dir / SQLITE_FILENAME
+    # `file.file` is the underlying SpooledTemporaryFile - streamed to a
+    # local temp file first (rather than read fully into memory), then
+    # uploaded to Vercel Blob from that path and immediately removed. This
+    # keeps this endpoint a plain `def` that FastAPI runs in its
+    # threadpool, same as the blocking introspection below needs anyway.
+    pathname = _sqlite_blob_pathname(current_user.id, connection.id)
+    fd, temp_path = tempfile.mkstemp(suffix=".sqlite")
+    os.close(fd)
     try:
-        # `file.file` is the underlying SpooledTemporaryFile - readable
-        # synchronously, which keeps this endpoint a plain `def` that
-        # FastAPI runs in its threadpool (as the blocking introspection
-        # below needs anyway).
-        with open(target_path, "wb") as handle:
+        with open(temp_path, "wb") as handle:
             shutil.copyfileobj(file.file, handle)
-    except OSError as exc:
+        storage_url = blob_storage.upload_file(
+            pathname, temp_path, content_type="application/x-sqlite3"
+        )
+    except (OSError, blob_storage.BlobStorageError) as exc:
         return _fail(db, connection, f"Could not save the uploaded database file: {exc}")
+    finally:
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
 
     # Reassign (rather than mutate) so SQLAlchemy sees the JSON column change.
-    connection.extra_params = {"storage_path": str(target_path)}
+    connection.extra_params = {"storage_url": storage_url}
     db.commit()
 
     return provision_connection(db, connection)
@@ -526,8 +532,8 @@ def reindex_connection(
     current_user: User = Depends(get_current_user),
 ) -> DatabaseConnection:
     """Re-introspect the database and rebuild its schema index from
-    scratch - run this after the user changes their schema. The old Qdrant
-    points are deleted first (inside provision_connection) so a dropped
+    scratch - run this after the user changes their schema. The old
+    schema_chunks/example_chunks rows are deleted first (inside provision_connection) so a dropped
     table disappears from the index rather than lingering."""
     _require_ai_configured()
     connection = _get_owned_connection(db, connection_id, current_user)
@@ -540,14 +546,15 @@ def delete_connection(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> None:
-    """Delete the row, its Qdrant schema points, and (for SQLite) the
-    uploaded database file. Chats that referenced it keep their history but
-    have `connection_id` set to NULL by the FK's ON DELETE SET NULL."""
+    """Delete the row, its schema/example rows, and (for SQLite) the
+    uploaded database file's blob. Chats that referenced it keep their
+    history but have `connection_id` set to NULL by the FK's ON DELETE SET
+    NULL."""
     connection = _get_owned_connection(db, connection_id, current_user)
 
     try:
         schema_rag.delete_connection_schema(connection.user_id, connection.id)
-    except Exception:  # noqa: BLE001 - a Qdrant hiccup shouldn't block the delete
+    except Exception:  # noqa: BLE001 - a storage hiccup shouldn't block the delete
         pass
     try:
         example_rag.delete_connection_examples(connection.user_id, connection.id)
@@ -555,7 +562,12 @@ def delete_connection(
         pass
 
     if connection.engine == DatabaseEngine.sqlite:
-        shutil.rmtree(_sqlite_dir(connection.user_id, connection.id), ignore_errors=True)
+        storage_url = (connection.extra_params or {}).get("storage_url")
+        if storage_url:
+            try:
+                blob_storage.delete_blob(storage_url)
+            except blob_storage.BlobStorageError:  # noqa: BLE001 - never blocks the delete
+                pass
 
     db.delete(connection)
     db.commit()

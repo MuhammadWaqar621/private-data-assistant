@@ -13,7 +13,13 @@ name: private-data-assistant
 
 services:
   postgres:
-    image: postgres:16
+    # pgvector/pgvector is the same Postgres image with the `vector`
+    # extension pre-installed (just not enabled until the Alembic
+    # migration runs `CREATE EXTENSION IF NOT EXISTS vector`) - this used
+    # to be a plain `postgres:16` image, with a separate `qdrant` service
+    # below for embeddings. Now everything lives in this one database; see
+    # app/engine/vector_store.py.
+    image: pgvector/pgvector:pg16
     container_name: private-data-assistant-postgres
     restart: unless-stopped
     environment:
@@ -30,16 +36,6 @@ services:
       timeout: 5s
       retries: 10
 
-  qdrant:
-    image: qdrant/qdrant:latest
-    container_name: private-data-assistant-qdrant
-    restart: unless-stopped
-    ports:
-      - "6333:6333"
-      - "6334:6334"
-    volumes:
-      - qdrant_data:/qdrant/storage
-
   backend:
     build:
       context: ./backend
@@ -49,19 +45,17 @@ services:
       - .env
     environment:
       DATABASE_URL: ${DATABASE_URL}
-      QDRANT_URL: ${QDRANT_URL}
+      BLOB_READ_WRITE_TOKEN: ${BLOB_READ_WRITE_TOKEN}
     ports:
       - "8000:8000"
     depends_on:
       postgres:
         condition: service_healthy
-      qdrant:
-        condition: service_started
     volumes:
-      # Bind-mounted so uploaded SQLite databases
-      # (backend/storage/{user_id}/{connection_id}/database.sqlite) survive
-      # container restarts without a dedicated volume, and so --reload
-      # picks up code changes.
+      # Bind-mounted so --reload picks up code changes. Uploaded SQLite
+      # databases no longer live under this mount - they go to Vercel Blob
+      # (see app/engine/blob_storage.py), which needs BLOB_READ_WRITE_TOKEN
+      # set in .env even for local docker-compose use.
       - ./backend:/app
 
   # The React + Vite app, built to static files and served by `serve` on
@@ -84,4 +78,3 @@ services:
 
 volumes:
   postgres_data:
-  qdrant_data:

@@ -42,13 +42,14 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = "development"
 
     # --- Database (this app's OWN metadata database) ----------------------
-    # Holds users, chats, messages and the *registration records* for the
-    # user's external databases - never any of the user's actual business
-    # data, which is only ever read live, on demand, from their own DB.
+    # Holds users, chats, messages, the *registration records* for the
+    # user's external databases, AND (via the `vector` extension) the
+    # schema/example embeddings that used to live in a separate Qdrant
+    # service - see app/engine/vector_store.py. Never any of the user's
+    # actual business data, which is only ever read live, on demand, from
+    # their own DB. On Vercel this is the Vercel Postgres (Neon-backed)
+    # connection string.
     DATABASE_URL: str = "postgresql://postgres:postgres@postgres:5432/private_data_assistant"
-
-    # --- Qdrant (vector DB - schema chunks only) --------------------------
-    QDRANT_URL: str = "http://qdrant:6333"
 
     # --- Frontend (used to build links in emails) -------------------------
     FRONTEND_URL: str = "http://localhost:5173"
@@ -76,8 +77,8 @@ class Settings(BaseSettings):
     AZURE_EM_API_KEY: Optional[str] = None
     AZURE_EM_API_VERSION: Optional[str] = None
     AZURE_EM_MODEL: Optional[str] = None
-    # Embedding vector size, used to size the Qdrant collection (see
-    # app/engine/schema_rag.py). Not required for the `connections_llm`
+    # Embedding vector size, used to size the pgvector columns (see
+    # app/engine/vector_store.py). Not required for the `connections_llm`
     # config-status group - it has a sensible code default (1536) in
     # app/engine/azure_client.get_embedding_dimensions(). Declared here
     # (even though app/engine/ reads env vars directly, not this Settings

@@ -200,11 +200,13 @@ curl -X POST http://localhost:8000/api/connections/sqlite \
   -F "file=@sample.sqlite"
 ```
 
-The file is copied to
-`backend/storage/{user_id}/{connection_id}/database.sqlite` inside the
-backend container (bind-mounted, so you can see it on the host too). It is
-opened `mode=ro` on every query - see the root README's per-engine
-read-only section.
+The file is uploaded to Vercel Blob at
+`{user_id}/{connection_id}/database.sqlite` (see
+`backend/app/engine/blob_storage.py`) - locally this needs
+`BLOB_READ_WRITE_TOKEN` set in `.env` even under docker-compose, since
+there is no local filesystem fallback once a connection is registered.
+Every query downloads it to a temp file and opens that `mode=ro` - see the
+root README's per-engine read-only section.
 
 ## SQL Server
 
@@ -284,7 +286,7 @@ rm -f sample.sqlite
 ```
 
 Delete the registrations too (this also removes their schema vectors from
-Qdrant and, for SQLite, the stored file):
+Postgres/pgvector and, for SQLite, the stored blob):
 
 ```bash
 curl -X DELETE http://localhost:8000/api/connections/1 -H "Authorization: Bearer $TOKEN"

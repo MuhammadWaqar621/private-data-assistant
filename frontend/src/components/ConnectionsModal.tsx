@@ -50,7 +50,7 @@ const EMPTY_FORM = {
  * registered, plus the form to add another.
  *
  * Registration is SYNCHRONOUS server-side (test -> introspect schema ->
- * embed into Qdrant), so submitting can take a few seconds and the
+ * embed into Postgres/pgvector), so submitting can take a few seconds and the
  * returned row already carries its final `status` - there is nothing to
  * poll. A `failed` row's `error_message` is written to be read by a human
  * ("password authentication failed", "no tables this account can see"), so

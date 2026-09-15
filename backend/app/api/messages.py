@@ -37,7 +37,7 @@ reasons, both real:
      DetachedInstanceError. So everything the stream needs (including the
      decrypted ConnectionInfo) is materialized first.
 
-Schema retrieval reads Qdrant ONLY (app/engine/schema_rag.py): sending a
+Schema retrieval reads the schema_chunks table ONLY (app/engine/schema_rag.py): sending a
 message never re-introspects the live database, and never touches the
 user's data at all unless and until the model actually calls run_query.
 """
@@ -193,7 +193,7 @@ async def send_message(
                 detail={"error": "credentials_unavailable", "message": str(exc)},
             )
 
-    # --- schema + example context (Qdrant only - never the live database) -
+    # --- schema + example context (Postgres/pgvector only - never the live database) -
     schema_context = ""
     example_context = ""
     if connection_id is not None:
@@ -204,7 +204,7 @@ async def send_message(
                 connection_id,
                 body.content,
             )
-        except Exception:  # noqa: BLE001 - a Qdrant/embedding hiccup must not
+        except Exception:  # noqa: BLE001 - a storage/embedding hiccup must not
             # kill the turn: the model is told it has no schema context and
             # will say so rather than guessing table names.
             schema_context = ""

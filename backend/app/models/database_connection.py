@@ -5,20 +5,21 @@ This row is metadata only. None of the user's actual data is ever copied
 into this application's database: the only things stored here are how to
 reach their database (host/port/database name/username), their password in
 encrypted form (see app/core/crypto.py), and whether the schema has been
-introspected and embedded into Qdrant yet. Every answer to a data question
-is produced by running a read-only query against their live database at
-the moment they ask - see app/engine/db_adapters/.
+introspected and embedded (into this app's own Postgres database, via
+pgvector - see app/engine/vector_store.py) yet. Every answer to a data
+question is produced by running a read-only query against their live
+database at the moment they ask - see app/engine/db_adapters/.
 
 `user_id` is the non-negotiable isolation boundary, exactly like the
 sibling project's Document model: every lookup in app/api/connections.py
 filters on it, and app/engine/schema_rag.py additionally applies BOTH
-`user_id` and `connection_id` as unconditional Qdrant filters, since
-cross-connection schema retrieval is never meaningful (a question about
-connection A's tables must never be answered with connection B's schema,
-even for the same user).
+`user_id` and `connection_id` as unconditional filters on the
+`schema_chunks` table, since cross-connection schema retrieval is never
+meaningful (a question about connection A's tables must never be answered
+with connection B's schema, even for the same user).
 
 Schema indexing (introspect -> chunk per table -> embed -> upsert into
-Qdrant, via app/engine/schema_rag.py) runs synchronously inside the
+`schema_chunks`, via app/engine/schema_rag.py) runs synchronously inside the
 registration request for this project's scope - `status` starts at
 "pending", moves to "indexing", and lands on "ready" (+
 `schema_indexed_at`) or "failed" (+ `error_message`) before the response
@@ -29,7 +30,8 @@ worker instead - see README.md's "Roadmap / known tradeoffs".
 would otherwise need a column each, e.g.:
   - postgres/mysql/mssql: {"ssl_mode": "require"}
   - mongodb:              {"auth_source": "admin"}
-  - sqlite:               {"storage_path": "storage/{user_id}/{connection_id}/database.sqlite"}
+  - sqlite:               {"storage_url": "<Vercel Blob public URL for
+                            {user_id}/{connection_id}/database.sqlite>"}
 """
 
 import enum

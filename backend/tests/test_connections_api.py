@@ -5,13 +5,17 @@ No real external database is involved: `get_adapter` is monkeypatched to a
 fake adapter and `schema_rag`'s indexing calls to no-ops, so these tests
 target the endpoint's OWN logic - ownership, credential handling, and the
 pending -> indexing -> ready/failed status machine - rather than driver
-behavior (which test_db_adapters_readonly.py covers) or Qdrant filtering
-(test_schema_qdrant_isolation.py).
+behavior (which test_db_adapters_readonly.py covers) or pgvector filtering
+(test_pgvector_isolation.py). SQLite uploads similarly mock
+app/engine/blob_storage.py's upload/delete functions (see the `fake_blob`
+fixture) rather than talking to Vercel Blob for real.
 
 The most important assertions in this file are the credential ones: a
 password must go in, be stored encrypted, be decryptable server-side, and
 NEVER appear in any response body in any form.
 """
+
+from typing import Dict
 
 import pytest
 
@@ -59,6 +63,27 @@ class FakeAdapter:
 
     def execute_read_only(self, conn, query, max_rows, timeout_seconds):  # pragma: no cover
         return [], []
+
+
+@pytest.fixture()
+def fake_blob(monkeypatch):
+    """Stands in for Vercel Blob: an in-memory dict keyed by pathname, with
+    `upload_file`/`delete_blob` monkeypatched to read/write/delete it
+    instead of making real HTTP calls against blob.vercel-storage.com."""
+    store: Dict[str, bytes] = {}
+
+    def _upload_file(pathname, local_path, content_type="application/octet-stream"):
+        with open(local_path, "rb") as handle:
+            store[pathname] = handle.read()
+        return f"fake-blob://{pathname}"
+
+    def _delete_blob(url):
+        pathname = url.replace("fake-blob://", "", 1)
+        store.pop(pathname, None)
+
+    monkeypatch.setattr(connections_module.blob_storage, "upload_file", _upload_file)
+    monkeypatch.setattr(connections_module.blob_storage, "delete_blob", _delete_blob)
+    return store
 
 
 @pytest.fixture()
@@ -153,7 +178,7 @@ def test_a_schema_introspection_failure_lands_as_failed(client, monkeypatch):
 
 def test_an_indexing_failure_lands_as_failed(client, monkeypatch, fake_stack):
     def _boom(**kwargs):
-        raise RuntimeError("Qdrant unreachable")
+        raise RuntimeError("Postgres (pgvector) unreachable")
 
     monkeypatch.setattr(schema_rag, "index_connection_schema", _boom)
     user = signup(client)
@@ -161,7 +186,7 @@ def test_an_indexing_failure_lands_as_failed(client, monkeypatch, fake_stack):
     body = _create(client, user).json()
 
     assert body["status"] == "failed"
-    assert "Qdrant unreachable" in body["error_message"]
+    assert "Postgres (pgvector) unreachable" in body["error_message"]
 
 
 def test_a_database_with_no_tables_lands_as_failed_with_an_explanation(
@@ -300,9 +325,8 @@ def test_the_default_port_is_filled_in_when_omitted(client, fake_stack):
 
 
 def test_uploading_a_sqlite_database_stores_the_file_and_records_its_path(
-    client, fake_stack, tmp_path, monkeypatch
+    client, fake_stack, fake_blob
 ):
-    monkeypatch.setattr(connections_module, "STORAGE_ROOT", tmp_path)
     user = signup(client)
 
     response = client.post(
@@ -318,16 +342,15 @@ def test_uploading_a_sqlite_database_stores_the_file_and_records_its_path(
     assert body["status"] == "ready"
     assert body["host"] is None
 
-    stored = tmp_path / str(1) / str(body["id"]) / "database.sqlite"
-    assert stored.exists()
-    # The path is derived server-side from the user id and the row id -
-    # never from the uploaded filename.
-    assert body["extra_params"]["storage_path"] == str(stored)
-    assert "mydata.sqlite" not in body["extra_params"]["storage_path"]
+    expected_pathname = f"1/{body['id']}/database.sqlite"
+    assert fake_blob[expected_pathname] == b"SQLite format 3\x00stub"
+    # The blob pathname is derived server-side from the user id and the row
+    # id - never from the uploaded filename.
+    assert body["extra_params"]["storage_url"] == f"fake-blob://{expected_pathname}"
+    assert "mydata.sqlite" not in body["extra_params"]["storage_url"]
 
 
-def test_uploading_a_sqlite_database_requires_a_name(client, fake_stack, tmp_path, monkeypatch):
-    monkeypatch.setattr(connections_module, "STORAGE_ROOT", tmp_path)
+def test_uploading_a_sqlite_database_requires_a_name(client, fake_stack, fake_blob):
     user = signup(client)
 
     response = client.post(
@@ -492,9 +515,8 @@ def test_delete_404s_for_another_users_connection_and_leaves_it_intact(client, f
 
 
 def test_deleting_a_sqlite_connection_removes_its_stored_file(
-    client, fake_stack, tmp_path, monkeypatch
+    client, fake_stack, fake_blob, monkeypatch
 ):
-    monkeypatch.setattr(connections_module, "STORAGE_ROOT", tmp_path)
     monkeypatch.setattr(schema_rag, "delete_connection_schema", lambda *a, **k: None)
     user = signup(client)
 
@@ -504,12 +526,12 @@ def test_deleting_a_sqlite_connection_removes_its_stored_file(
         data={"name": "Local"},
         headers=auth_headers(user),
     ).json()
-    stored = tmp_path / "1" / str(created["id"]) / "database.sqlite"
-    assert stored.exists()
+    pathname = f"1/{created['id']}/database.sqlite"
+    assert pathname in fake_blob
 
     client.delete(f"/api/connections/{created['id']}", headers=auth_headers(user))
 
-    assert not stored.exists()
+    assert pathname not in fake_blob
 
 
 def test_connection_endpoints_require_authentication(client):

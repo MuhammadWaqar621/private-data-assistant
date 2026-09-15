@@ -4,9 +4,14 @@ pydantic[email]==2.10.4
 pydantic-settings==2.7.1
 sqlalchemy==2.0.36
 alembic==1.14.0
-# This app's OWN metadata database (users/chats/messages/connections).
+# This app's OWN metadata database (users/chats/messages/connections) AND,
+# via the `vector` extension, its schema/example embeddings - see
+# app/engine/vector_store.py. pgvector-python adds the SQLAlchemy `Vector`
+# column type and query operators (cosine distance etc); it needs the
+# server-side `vector` extension enabled, which the Alembic migration
+# creates with `CREATE EXTENSION IF NOT EXISTS vector`.
 psycopg2-binary==2.9.10
-qdrant-client==1.12.1
+pgvector==0.3.6
 # Used for both Azure OpenAI (embeddings, always) and Groq (chat, via its
 # OpenAI-compatible API) - one SDK, two providers. See app/engine/.
 openai==1.59.6

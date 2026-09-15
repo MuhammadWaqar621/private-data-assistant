@@ -61,7 +61,9 @@ class ConnectionInfo:
     # Engine-specific options - see app/models/database_connection.py:
     #   postgres/mysql/mssql: {"ssl_mode": "require"}
     #   mongodb:              {"auth_source": "admin"}
-    #   sqlite:               {"storage_path": "storage/1/2/database.sqlite"}
+    #   sqlite:               {"storage_url": "https://<store>.public.blob.vercel-storage.com/1/2/database.sqlite"}
+    #                         (or {"storage_path": "<local file>"} for local
+    #                         development without a Vercel Blob store)
     extra_params: Dict[str, Any] = field(default_factory=dict)
 
 

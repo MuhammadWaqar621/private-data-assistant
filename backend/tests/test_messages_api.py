@@ -58,8 +58,8 @@ def write_session(db_engine, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def no_schema_lookup(monkeypatch):
-    """Schema retrieval hits Qdrant + Azure; stub it and record the args so
-    tests can assert it is scoped to the caller."""
+    """Schema retrieval hits Postgres (pgvector) + Azure; stub it and
+    record the args so tests can assert it is scoped to the caller."""
     calls = []
 
     def _retrieve(user_id, connection_id, question, *args, **kwargs):
@@ -306,7 +306,7 @@ def test_a_chat_with_no_connection_passes_none_and_retrieves_no_schema(
     assert call["connection_id"] is None
     assert call["engine_name"] is None
     assert call["schema_context"] == ""
-    assert no_schema_lookup == []  # Qdrant was never touched
+    assert no_schema_lookup == []  # the schema_chunks table was never touched
 
 
 def test_prior_turns_are_passed_as_plain_dicts(client, monkeypatch):

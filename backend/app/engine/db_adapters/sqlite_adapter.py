@@ -3,12 +3,22 @@ SQLite adapter - stdlib `sqlite3`, operating on a database FILE this
 application stores itself.
 
 SQLite is the one engine where there is no server to connect to: the user
-uploads a `.sqlite`/`.db` file, `app/api/connections.py` writes it to
-`storage/{user_id}/{connection_id}/database.sqlite` (mirroring the sibling
-project's document-storage convention), and `extra_params["storage_path"]`
-records where. That path is produced by the server from the authenticated
-user id and the row's own id - it is never taken from client input - and
-this adapter refuses anything that isn't an existing file.
+uploads a `.sqlite`/`.db` file. `app/api/connections.py` uploads it to
+Vercel Blob at `{user_id}/{connection_id}/database.sqlite` (see
+app/engine/blob_storage.py) and records the blob's public URL in
+`extra_params["storage_url"]`; that pathname is derived server-side from
+the authenticated user id and the row's own id, never from client input.
+
+Because a Vercel serverless function has no persistent writable disk, this
+adapter cannot just open that path directly the way it could against a
+local bind-mounted volume: every method that needs the file DOWNLOADS the
+blob to a fresh temp file first (`tempfile` - the one writable location on
+Vercel's Python runtime is /tmp), operates on that local copy, and always
+removes it in a `finally` regardless of outcome. A local
+`extra_params["storage_path"]` (an already-on-disk path) is still honored
+directly with no download step, for local development without a Blob
+store configured and for tests that write a temp SQLite file themselves -
+see `_local_copy()` below.
 
 Read-only story - in one respect the strongest of the five, in another the
 weakest:
@@ -44,8 +54,10 @@ that PRAGMA appears on the read-only blocklist - that blocklist governs
 import os
 import sqlite3
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from contextlib import contextmanager
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
+from app.engine import blob_storage
 from app.engine.db_adapters.base import (
     SAMPLE_ROW_LIMIT,
     ColumnSchema,
@@ -69,14 +81,52 @@ _PROGRESS_HANDLER_INSTRUCTIONS = 1000
 MAX_TABLES_INTROSPECTED = 200
 
 
-def _storage_path(conn: ConnectionInfo) -> str:
-    path = (conn.extra_params or {}).get("storage_path") or conn.database
-    if not path:
+@contextmanager
+def _local_copy(conn: ConnectionInfo) -> Iterator[str]:
+    """Yield a local filesystem path to this connection's SQLite file,
+    downloading it from Vercel Blob into a temp file first if that's where
+    it lives - and always cleaning up any temp file afterwards, success or
+    not.
+
+    Two shapes of `extra_params`, checked in order:
+      - `storage_url` - a Vercel Blob public URL (the normal case: see
+        app/api/connections.py's SQLite upload route). Downloaded to a
+        fresh temp file for the duration of this context manager only.
+      - `storage_path` - an already-local path (local development without
+        a Blob store configured, and what tests write directly). Used
+        as-is, nothing downloaded or removed.
+    """
+    extra_params = conn.extra_params or {}
+    storage_url = extra_params.get("storage_url")
+    storage_path = extra_params.get("storage_path") or conn.database
+
+    if storage_url:
+        try:
+            temp_path = blob_storage.download_to_temp(storage_url, suffix=".sqlite")
+        except blob_storage.BlobStorageError as exc:
+            raise ConnectionFailedError(
+                f"Could not download the SQLite database from storage: {exc}"
+            ) from exc
+        try:
+            yield temp_path
+        finally:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+        return
+
+    if not storage_path:
         raise ConnectionFailedError(
             "This SQLite connection has no database file recorded - re-upload "
             "the .sqlite file to fix it."
         )
-    return str(path)
+    if not os.path.isfile(storage_path):
+        raise ConnectionFailedError(
+            "The uploaded SQLite database file is missing from storage - "
+            "re-upload it to fix this connection."
+        )
+    yield str(storage_path)
 
 
 class SQLiteAdapter(DBAdapter):
@@ -84,13 +134,7 @@ class SQLiteAdapter(DBAdapter):
 
     # --- connection --------------------------------------------------------
 
-    def _connect(self, conn: ConnectionInfo, timeout_seconds: int) -> sqlite3.Connection:
-        path = _storage_path(conn)
-        if not os.path.isfile(path):
-            raise ConnectionFailedError(
-                "The uploaded SQLite database file is missing from the "
-                "server's storage - re-upload it to fix this connection."
-            )
+    def _open(self, path: str, timeout_seconds: int) -> sqlite3.Connection:
         # mode=ro: SQLite refuses writes itself, independently of our guard.
         uri = f"file:{path}?mode=ro"
         try:
@@ -121,8 +165,9 @@ class SQLiteAdapter(DBAdapter):
     def test_connection(self, conn: ConnectionInfo) -> Tuple[bool, Optional[str]]:
         connection = None
         try:
-            connection = self._connect(conn, timeout_seconds=10)
-            connection.execute("SELECT 1").fetchall()
+            with _local_copy(conn) as path:
+                connection = self._open(path, timeout_seconds=10)
+                connection.execute("SELECT 1").fetchall()
             return True, None
         except Exception as exc:  # noqa: BLE001 - contract: never raises
             return False, f"Could not open the SQLite database: {exc}"
@@ -131,31 +176,32 @@ class SQLiteAdapter(DBAdapter):
                 connection.close()
 
     def introspect_schema(self, conn: ConnectionInfo) -> List[TableSchema]:
-        connection = self._connect(conn, timeout_seconds=30)
-        try:
-            names = [
-                row[0]
-                for row in connection.execute(
-                    "SELECT name FROM sqlite_master "
-                    "WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' "
-                    "ORDER BY name"
-                ).fetchall()
-            ]
+        with _local_copy(conn) as path:
+            connection = self._open(path, timeout_seconds=30)
+            try:
+                names = [
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_master "
+                        "WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' "
+                        "ORDER BY name"
+                    ).fetchall()
+                ]
 
-            tables: List[TableSchema] = []
-            for table_name in names[:MAX_TABLES_INTROSPECTED]:
-                tables.append(
-                    TableSchema(
-                        name=table_name,
-                        columns=self._introspect_columns(connection, table_name),
-                        sample_rows=self._sample_rows(connection, table_name),
+                tables: List[TableSchema] = []
+                for table_name in names[:MAX_TABLES_INTROSPECTED]:
+                    tables.append(
+                        TableSchema(
+                            name=table_name,
+                            columns=self._introspect_columns(connection, table_name),
+                            sample_rows=self._sample_rows(connection, table_name),
+                        )
                     )
-                )
-            return tables
-        except sqlite3.Error as exc:
-            raise QueryExecutionError(f"Could not read the SQLite schema: {exc}") from exc
-        finally:
-            connection.close()
+                return tables
+            except sqlite3.Error as exc:
+                raise QueryExecutionError(f"Could not read the SQLite schema: {exc}") from exc
+            finally:
+                connection.close()
 
     def _introspect_columns(
         self, connection: sqlite3.Connection, table_name: str
@@ -211,29 +257,30 @@ class SQLiteAdapter(DBAdapter):
         cleaned = assert_read_only_sql(query)
         max_rows = max(1, int(max_rows))
 
-        connection = self._connect(conn, timeout_seconds)
-        try:
-            self._install_deadline(connection, timeout_seconds)
-
-            wrapped = wrap_with_row_limit(cleaned, max_rows, self.engine_name)
-            if wrapped is not None:
-                try:
-                    return self._run(connection, wrapped, max_rows)
-                except NotReadOnlyError:
-                    raise
-                except QueryExecutionError:
-                    # Same fallback as the SQLAlchemy adapters: a query
-                    # shape that can't be wrapped is run as written and
-                    # truncated in Python instead.
-                    pass
-
-            return self._run(connection, cleaned, max_rows)
-        finally:
+        with _local_copy(conn) as path:
+            connection = self._open(path, timeout_seconds)
             try:
-                connection.rollback()
+                self._install_deadline(connection, timeout_seconds)
+
+                wrapped = wrap_with_row_limit(cleaned, max_rows, self.engine_name)
+                if wrapped is not None:
+                    try:
+                        return self._run(connection, wrapped, max_rows)
+                    except NotReadOnlyError:
+                        raise
+                    except QueryExecutionError:
+                        # Same fallback as the SQLAlchemy adapters: a query
+                        # shape that can't be wrapped is run as written and
+                        # truncated in Python instead.
+                        pass
+
+                return self._run(connection, cleaned, max_rows)
             finally:
-                connection.set_progress_handler(None, 0)
-                connection.close()
+                try:
+                    connection.rollback()
+                finally:
+                    connection.set_progress_handler(None, 0)
+                    connection.close()
 
     def _run(
         self, connection: sqlite3.Connection, sql: str, max_rows: int

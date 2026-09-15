@@ -4,7 +4,7 @@ Private Data Assistant backend entrypoint.
 The product: a user registers a connection to their OWN external database
 (PostgreSQL, MySQL/MariaDB, SQL Server, SQLite or MongoDB) and asks
 questions about their live data in plain language. The backend indexes that
-database's SCHEMA into Qdrant, retrieves the relevant tables per question,
+database's SCHEMA into Postgres (via pgvector), retrieves the relevant tables per question,
 and lets an LLM write a read-only query which it then executes against the
 real database - see README.md for the full flow.
 

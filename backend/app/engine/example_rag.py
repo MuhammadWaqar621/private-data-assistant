@@ -1,8 +1,15 @@
 """
-Few-shot example-query RAG: a second Qdrant collection, alongside
-schema_rag's table chunks, that stores QUESTION -> QUERY pairs so the
-model has concrete worked examples of the join style a connection's schema
-actually needs - not just column lists.
+Few-shot example-query RAG: a second pgvector-backed table
+(`example_chunks`, alongside schema_rag's `schema_chunks`) that stores
+QUESTION -> QUERY pairs so the model has concrete worked examples of the
+join style a connection's schema actually needs - not just column lists.
+
+Storage backend: this used to be a second Qdrant collection
+(`private_data_assistant_examples`). It is now the `example_chunks` table
+in this app's own Postgres database, via app/engine/vector_store.py - see
+that module's docstring for the isolation reasoning. Every public function
+below kept its exact signature through that migration, so
+app/api/connections.py and app/api/messages.py needed no changes.
 
 Two sources feed it, both write through the same `index_example()`:
 
@@ -29,24 +36,16 @@ embed the new question, search filtered by BOTH `user_id` and
 identical reasoning applies here), top-K nearest by similarity to past
 QUESTIONS (not past queries - a question is what a new question should be
 compared against).
-
-Configuration is read directly from environment variables, same reason as
-schema_rag.py / azure_client.py (see app/engine/__init__.py).
 """
 
-import os
-import uuid
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import Dict, List, Optional, Sequence
 
-from qdrant_client import QdrantClient
-from qdrant_client.http import models as qmodels
+from sqlalchemy.engine import Engine
 
-from app.engine.azure_client import embed_texts, get_embedding_dimensions
+from app.engine import vector_store
+from app.engine.azure_client import embed_texts
 from app.engine.db_adapters.base import TableSchema
-
-COLLECTION_NAME = os.getenv("QDRANT_EXAMPLES_COLLECTION", "private_data_assistant_examples")
 
 DEFAULT_TOP_K = 3
 
@@ -63,42 +62,14 @@ class ExampleDocument:
     query: str
 
 
-@lru_cache
-def _client() -> QdrantClient:
-    # Deliberately duplicated from schema_rag.py rather than imported: this
-    # keeps example_rag.py independently readable and independently
-    # testable, matching the rest of app/engine/'s style of small,
-    # self-contained modules.
-    url = (os.getenv("QDRANT_URL") or "http://localhost:6333").strip()
-    api_key = (os.getenv("QDRANT_API_KEY") or "").strip() or None
-    return QdrantClient(url=url, api_key=api_key)
-
-
-def ensure_collection(client: Optional[QdrantClient] = None) -> None:
-    client = client or _client()
-    existing = {collection.name for collection in client.get_collections().collections}
-    if COLLECTION_NAME in existing:
-        return
-    client.create_collection(
-        collection_name=COLLECTION_NAME,
-        vectors_config=qmodels.VectorParams(
-            size=get_embedding_dimensions(),
-            distance=qmodels.Distance.COSINE,
-        ),
-    )
-
-
 def _point_id(user_id: int, connection_id: int, question: str) -> str:
-    """Deterministic UUID from (user, connection, normalized question), so
+    """Deterministic id from (user, connection, normalized question), so
     asking the same question twice OVERWRITES the stored example (with
     whatever query most recently answered it) instead of accumulating
     duplicates that would all rank equally in a future search."""
     normalized = " ".join(question.strip().lower().split())
-    return str(
-        uuid.uuid5(
-            uuid.NAMESPACE_OID,
-            f"user:{user_id}:connection:{connection_id}:example:{normalized}",
-        )
+    return vector_store.point_id(
+        "user", user_id, "connection", connection_id, "example", normalized
     )
 
 
@@ -108,62 +79,44 @@ def index_example(
     engine_name: str,
     question: str,
     query: str,
-    client: Optional[QdrantClient] = None,
+    client: Optional[Engine] = None,
 ) -> bool:
     """Embed `question` and store it alongside `query` as one example
-    point. Returns False (without raising) for blank input - callers treat
+    row. Returns False (without raising) for blank input - callers treat
     this as best-effort and never let a failure here break a chat turn."""
     question = (question or "").strip()
     query = (query or "").strip()
     if not question or not query:
         return False
 
-    client = client or _client()
-    ensure_collection(client)
-
     embeddings = embed_texts([question])
     if not embeddings:
         return False
 
-    point = qmodels.PointStruct(
-        id=_point_id(user_id, connection_id, question),
-        vector=list(embeddings[0]),
-        payload={
-            "user_id": user_id,
-            "connection_id": connection_id,
-            "engine": engine_name,
-            "question": question,
-            "query": query,
-        },
-    )
-    client.upsert(collection_name=COLLECTION_NAME, points=[point])
+    row = {
+        "id": _point_id(user_id, connection_id, question),
+        "user_id": user_id,
+        "connection_id": connection_id,
+        "engine": engine_name,
+        "question": question,
+        "query": query,
+        "seeded": False,
+        "embedding": list(embeddings[0]),
+    }
+    vector_store.upsert_rows(vector_store.example_chunks, [row], engine=client)
     return True
 
 
 def delete_connection_examples(
     user_id: int,
     connection_id: int,
-    client: Optional[QdrantClient] = None,
+    client: Optional[Engine] = None,
 ) -> None:
     """Remove every example for one connection - called on connection
     delete, and before re-seeding on a schema re-index (mirrors
     schema_rag.delete_connection_schema exactly, same reasoning)."""
-    client = client or _client()
-    ensure_collection(client)
-    client.delete(
-        collection_name=COLLECTION_NAME,
-        points_selector=qmodels.FilterSelector(
-            filter=qmodels.Filter(
-                must=[
-                    qmodels.FieldCondition(
-                        key="user_id", match=qmodels.MatchValue(value=user_id)
-                    ),
-                    qmodels.FieldCondition(
-                        key="connection_id", match=qmodels.MatchValue(value=connection_id)
-                    ),
-                ]
-            )
-        ),
+    vector_store.delete_rows(
+        vector_store.example_chunks, user_id, connection_id, engine=client
     )
 
 
@@ -172,7 +125,7 @@ def retrieve_relevant_examples(
     connection_id: int,
     question: str,
     top_k: int = DEFAULT_TOP_K,
-    client: Optional[QdrantClient] = None,
+    client: Optional[Engine] = None,
 ) -> str:
     """Embed `question`, pull the top-K nearest past QUESTIONS for this
     (user, connection), and render each as a "Q / Query" pair for the
@@ -186,35 +139,26 @@ def retrieve_relevant_examples(
     if not question:
         return ""
 
-    client = client or _client()
     embeddings = embed_texts([question])
     if not embeddings:
         return ""
 
-    query_filter = qmodels.Filter(
-        must=[
-            qmodels.FieldCondition(key="user_id", match=qmodels.MatchValue(value=user_id)),
-            qmodels.FieldCondition(
-                key="connection_id", match=qmodels.MatchValue(value=connection_id)
-            ),
-        ]
-    )
-
     try:
-        hits = client.search(
-            collection_name=COLLECTION_NAME,
-            query_vector=list(embeddings[0]),
-            query_filter=query_filter,
-            limit=top_k,
+        hits = vector_store.search_rows(
+            vector_store.example_chunks,
+            embeddings[0],
+            user_id=user_id,
+            connection_id=connection_id,
+            top_k=top_k,
+            engine=client,
         )
-    except Exception:  # noqa: BLE001 - collection may not exist yet on a brand-new deployment
+    except Exception:  # noqa: BLE001 - table may not exist yet on a brand-new deployment
         return ""
 
     blocks = []
     for hit in hits:
-        payload = hit.payload or {}
-        q = payload.get("question", "")
-        query_text = payload.get("query", "")
+        q = hit.payload.get("question", "")
+        query_text = hit.payload.get("query", "")
         if not q or not query_text:
             continue
         blocks.append(f"Q: {q}\nQuery: {query_text}")
@@ -336,7 +280,7 @@ def seed_fk_join_examples(
     connection_id: int,
     engine_name: str,
     tables: Sequence[TableSchema],
-    client: Optional[QdrantClient] = None,
+    client: Optional[Engine] = None,
 ) -> int:
     """Generate and index the FK-derived examples for one connection.
     Best-effort: any failure here must not fail connection registration,
@@ -347,28 +291,22 @@ def seed_fk_join_examples(
     if not documents:
         return 0
 
-    client = client or _client()
-    ensure_collection(client)
-
     questions = [document.question for document in documents]
     embeddings = embed_texts(questions)
     if not embeddings or len(embeddings) != len(documents):
         return 0
 
-    points = [
-        qmodels.PointStruct(
-            id=_point_id(user_id, connection_id, document.question),
-            vector=list(embedding),
-            payload={
-                "user_id": user_id,
-                "connection_id": connection_id,
-                "engine": engine_name,
-                "question": document.question,
-                "query": document.query,
-                "seeded": True,
-            },
-        )
+    rows = [
+        {
+            "id": _point_id(user_id, connection_id, document.question),
+            "user_id": user_id,
+            "connection_id": connection_id,
+            "engine": engine_name,
+            "question": document.question,
+            "query": document.query,
+            "seeded": True,
+            "embedding": list(embedding),
+        }
         for document, embedding in zip(documents, embeddings)
     ]
-    client.upsert(collection_name=COLLECTION_NAME, points=points)
-    return len(points)
+    return vector_store.upsert_rows(vector_store.example_chunks, rows, engine=client)

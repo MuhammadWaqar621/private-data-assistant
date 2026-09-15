@@ -6,22 +6,28 @@ question is actually about.
 Why this exists at all: a real database can have hundreds of tables and
 thousands of columns - far more than fits in a prompt, and mostly
 irrelevant to any single question. So the schema is chunked one-chunk-per-
-table, embedded, and stored in Qdrant; at question time the question is
-embedded and the top-K nearest table chunks are pulled back as context for
-the text-to-query call. It is exactly the sibling project's document-RAG
+table, embedded, and stored in this app's own Postgres database (the
+`schema_chunks` table, via the `vector` extension - see
+app/engine/vector_store.py); at question time the question is embedded and
+the top-K nearest table chunks are pulled back as context for the
+text-to-query call. It is exactly the sibling project's document-RAG
 pipeline with tables in place of pages.
 
-Configuration is read directly from environment variables (QDRANT_URL,
-optional QDRANT_API_KEY for Qdrant Cloud, QDRANT_COLLECTION) - see
-azure_client.py's module docstring for why this package avoids importing
-app.core.config.
+Storage backend: this used to be a Qdrant collection. It is now a table in
+the SAME Postgres database this app's metadata already lives in (Vercel
+Postgres/Neon supports the `vector` extension natively), via
+app/engine/vector_store.py - see that module's docstring for the isolation
+reasoning and why it reads DATABASE_URL directly rather than importing
+app.db/app.models. Every public function below kept its exact signature
+through that migration, so app/api/connections.py and app/api/messages.py
+needed no changes beyond nothing at all.
 
 --------------------------------------------------------------------------
 ISOLATION - the single most important property in this project
 --------------------------------------------------------------------------
-Every point carries `user_id` AND `connection_id` in its payload, and
-`search_schema()` applies BOTH as unconditional `must` filter conditions on
-every single search. Neither is ever optional:
+Every row carries `user_id` AND `connection_id`, and `search_schema()`
+applies BOTH as unconditional `WHERE` conditions on every single search.
+Neither is ever optional:
 
   - `user_id`, for the obvious reason: one account's database schema must
     never be retrievable by another. (Schema is not innocuous - table and
@@ -36,26 +42,20 @@ every single search. Neither is ever optional:
 `connection_id` is a per-user autoincrement-shaped integer, so two
 different users routinely hold the SAME numeric connection_id - which is
 precisely why `user_id` cannot be dropped just because `connection_id` is
-present. See tests/test_schema_qdrant_isolation.py, which proves both
-directions against a real Qdrant instance.
+present. See tests/test_pgvector_isolation.py, which proves both
+directions against a real Postgres+pgvector instance.
 
-Do not weaken either condition (e.g. to a `should` clause) without a very
-good reason.
+Do not weaken either condition without a very good reason.
 """
 
-import os
-import uuid
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import Any, Dict, List, Optional, Sequence
 
-from qdrant_client import QdrantClient
-from qdrant_client.http import models as qmodels
+from sqlalchemy.engine import Engine
 
-from app.engine.azure_client import embed_texts, get_embedding_dimensions
+from app.engine import vector_store
+from app.engine.azure_client import embed_texts
 from app.engine.db_adapters.base import TableSchema
-
-COLLECTION_NAME = os.getenv("QDRANT_COLLECTION", "private_data_assistant_schema")
 
 DEFAULT_TOP_K = 8
 
@@ -80,29 +80,6 @@ class SchemaSearchResult:
     text: str
     engine: str
     score: float
-
-
-@lru_cache
-def get_qdrant_client() -> QdrantClient:
-    url = (os.getenv("QDRANT_URL") or "http://localhost:6333").strip()
-    api_key = (os.getenv("QDRANT_API_KEY") or "").strip() or None
-    return QdrantClient(url=url, api_key=api_key)
-
-
-def ensure_collection(client: Optional[QdrantClient] = None) -> None:
-    """Create the collection if it doesn't exist yet, sized for the
-    configured embedding model (AZURE_EM_DIMENSIONS, default 1536)."""
-    client = client or get_qdrant_client()
-    existing = {collection.name for collection in client.get_collections().collections}
-    if COLLECTION_NAME in existing:
-        return
-    client.create_collection(
-        collection_name=COLLECTION_NAME,
-        vectors_config=qmodels.VectorParams(
-            size=get_embedding_dimensions(),
-            distance=qmodels.Distance.COSINE,
-        ),
-    )
 
 
 # --- chunking ---------------------------------------------------------------
@@ -185,17 +162,12 @@ def build_table_documents(tables: Sequence[TableSchema]) -> List[TableDocument]:
 
 
 def _point_id(user_id: int, connection_id: int, table_name: str) -> str:
-    """Deterministic UUID from (user, connection, table), so re-indexing a
-    connection overwrites its previous points instead of accumulating
-    duplicates. The user_id is part of the key as well as the payload:
+    """Deterministic id from (user, connection, table), so re-indexing a
+    connection overwrites its previous row instead of accumulating
+    duplicates. The user_id is part of the key as well as a stored column:
     two users' identically-named tables on identically-numbered
-    connections must never collide onto one point."""
-    return str(
-        uuid.uuid5(
-            uuid.NAMESPACE_OID,
-            f"user:{user_id}:connection:{connection_id}:table:{table_name}",
-        )
-    )
+    connections must never collide onto one row."""
+    return vector_store.point_id("user", user_id, "connection", connection_id, "table", table_name)
 
 
 def upsert_table_points(
@@ -204,43 +176,41 @@ def upsert_table_points(
     engine_name: str,
     documents: Sequence[TableDocument],
     embeddings: Sequence[Sequence[float]],
-    client: Optional[QdrantClient] = None,
+    client: Optional[Engine] = None,
 ) -> int:
     """Low-level upsert: takes embeddings that have already been computed.
 
     Split out from `index_connection_schema()` below so the isolation tests
-    can write points with cheap synthetic vectors instead of calling Azure -
+    can write rows with cheap synthetic vectors instead of calling Azure -
     the filtering behavior under test doesn't depend on the vectors at all.
+
+    `client` (kept under its historical name from the Qdrant-client days) is
+    an optional SQLAlchemy `Engine` override, used by tests to point at a
+    disposable database/schema instead of the real one.
     """
     if len(documents) != len(embeddings):
         raise ValueError("documents and embeddings must be the same length")
 
-    client = client or get_qdrant_client()
-    ensure_collection(client)
-
-    points = [
-        qmodels.PointStruct(
-            id=_point_id(user_id, connection_id, document.table_name),
-            vector=list(embedding),
-            payload={
-                "user_id": user_id,
-                "connection_id": connection_id,
-                # The DB engine type travels with the point so
-                # retrieve_relevant_schema()'s context can tell the model
-                # which dialect to write (T-SQL vs Postgres vs a Mongo
-                # operation spec) without a second lookup.
-                "engine": engine_name,
-                "table_name": document.table_name,
-                "text": document.text,
-            },
-        )
-        for document, embedding in zip(documents, embeddings)
-    ]
-    if not points:
+    if not documents:
         return 0
 
-    client.upsert(collection_name=COLLECTION_NAME, points=points)
-    return len(points)
+    rows = [
+        {
+            "id": _point_id(user_id, connection_id, document.table_name),
+            "user_id": user_id,
+            "connection_id": connection_id,
+            # The DB engine type travels with the row so
+            # retrieve_relevant_schema()'s context can tell the model
+            # which dialect to write (T-SQL vs Postgres vs a Mongo
+            # operation spec) without a second lookup.
+            "engine": engine_name,
+            "table_name": document.table_name,
+            "text": document.text,
+            "embedding": list(embedding),
+        }
+        for document, embedding in zip(documents, embeddings)
+    ]
+    return vector_store.upsert_rows(vector_store.schema_chunks, rows, engine=client)
 
 
 def index_connection_schema(
@@ -248,10 +218,10 @@ def index_connection_schema(
     connection_id: int,
     engine_name: str,
     tables: Sequence[TableSchema],
-    client: Optional[QdrantClient] = None,
+    client: Optional[Engine] = None,
 ) -> int:
     """Chunk -> embed -> upsert one connection's whole schema. Returns the
-    number of points written.
+    number of rows written.
 
     Callers must have checked `azure_client.ai_configured()` first (same
     contract as everything else in this engine)."""
@@ -272,37 +242,17 @@ def index_connection_schema(
 def delete_connection_schema(
     user_id: int,
     connection_id: int,
-    client: Optional[QdrantClient] = None,
+    client: Optional[Engine] = None,
 ) -> None:
-    """Remove every point for one connection - called when a connection is
+    """Remove every row for one connection - called when a connection is
     deleted, and before re-indexing on a schema refresh (so a table that
     has since been dropped doesn't linger in the index).
 
     Filters on user_id as well as connection_id: a bug that passed the
     wrong connection_id must not be able to delete a different account's
-    points."""
-    client = client or get_qdrant_client()
-    # Same reason as upsert_table_points(): on a brand-new Qdrant instance
-    # the collection doesn't exist yet, and this is called (from
-    # provision_connection()) BEFORE index_connection_schema() ever gets a
-    # chance to create it via ensure_collection() - so the very first
-    # connection any user ever registers would otherwise fail here with a
-    # 404 "Collection doesn't exist" before indexing is ever attempted.
-    ensure_collection(client)
-    client.delete(
-        collection_name=COLLECTION_NAME,
-        points_selector=qmodels.FilterSelector(
-            filter=qmodels.Filter(
-                must=[
-                    qmodels.FieldCondition(
-                        key="user_id", match=qmodels.MatchValue(value=user_id)
-                    ),
-                    qmodels.FieldCondition(
-                        key="connection_id", match=qmodels.MatchValue(value=connection_id)
-                    ),
-                ]
-            )
-        ),
+    rows."""
+    vector_store.delete_rows(
+        vector_store.schema_chunks, user_id, connection_id, engine=client
     )
 
 
@@ -314,39 +264,29 @@ def search_schema(
     user_id: int,
     connection_id: int,
     top_k: int = DEFAULT_TOP_K,
-    client: Optional[QdrantClient] = None,
+    client: Optional[Engine] = None,
 ) -> List[SchemaSearchResult]:
     """Vector search over schema chunks, scoped to (user_id, connection_id).
 
-    BOTH conditions are REQUIRED `must` filters on every call - there is no
-    parameter to relax either one, by design. A table chunk stored under a
-    different user_id, or under a different connection_id, is never
-    returned here no matter how similar its embedding is to the query. See
-    the module docstring.
+    BOTH conditions are REQUIRED on every call - there is no parameter to
+    relax either one, by design. A table chunk stored under a different
+    user_id, or under a different connection_id, is never returned here no
+    matter how similar its embedding is to the query. See the module
+    docstring.
     """
-    client = client or get_qdrant_client()
-
-    query_filter = qmodels.Filter(
-        must=[
-            qmodels.FieldCondition(key="user_id", match=qmodels.MatchValue(value=user_id)),
-            qmodels.FieldCondition(
-                key="connection_id", match=qmodels.MatchValue(value=connection_id)
-            ),
-        ]
+    hits = vector_store.search_rows(
+        vector_store.schema_chunks,
+        query_embedding,
+        user_id=user_id,
+        connection_id=connection_id,
+        top_k=top_k,
+        engine=client,
     )
-
-    hits = client.search(
-        collection_name=COLLECTION_NAME,
-        query_vector=list(query_embedding),
-        query_filter=query_filter,
-        limit=top_k,
-    )
-
     return [
         SchemaSearchResult(
-            table_name=(hit.payload or {}).get("table_name", ""),
-            text=(hit.payload or {}).get("text", ""),
-            engine=(hit.payload or {}).get("engine", ""),
+            table_name=hit.payload.get("table_name", ""),
+            text=hit.payload.get("text", ""),
+            engine=hit.payload.get("engine", ""),
             score=hit.score,
         )
         for hit in hits
@@ -358,19 +298,19 @@ def retrieve_relevant_schema(
     connection_id: int,
     question: str,
     top_k: int = DEFAULT_TOP_K,
-    client: Optional[QdrantClient] = None,
+    client: Optional[Engine] = None,
 ) -> str:
     """Embed `question`, pull the top-K matching table chunks for this
     (user, connection), and join them into one context string for the
     text-to-query prompt.
 
-    Returns "" when nothing matches or the connection has no points yet
+    Returns "" when nothing matches or the connection has no rows yet
     (not-yet-indexed, or an empty database) - the caller passes that empty
     string straight through, and AGENT_SYSTEM_PROMPT tells the model what
-    to do when it has no schema to work from. Importantly this touches
-    Qdrant ONLY: answering a question never re-reads the user's live
-    database schema, and never touches their data until the model actually
-    asks to run a query.
+    to do when it has no schema to work from. Importantly this touches the
+    schema_chunks table ONLY: answering a question never re-reads the
+    user's live database schema, and never touches their data until the
+    model actually asks to run a query.
 
     Note there is no score threshold here, unlike the sibling project's
     document retrieval. Schema chunks are not "facts to ground an answer
@@ -384,13 +324,16 @@ def retrieve_relevant_schema(
     if not embeddings:
         return ""
 
-    results = search_schema(
-        embeddings[0],
-        user_id=user_id,
-        connection_id=connection_id,
-        top_k=top_k,
-        client=client,
-    )
+    try:
+        results = search_schema(
+            embeddings[0],
+            user_id=user_id,
+            connection_id=connection_id,
+            top_k=top_k,
+            client=client,
+        )
+    except Exception:  # noqa: BLE001 - a brand-new deployment with no rows/table yet
+        return ""
     if not results:
         return ""
 
@@ -398,22 +341,12 @@ def retrieve_relevant_schema(
 
 
 def schema_stats(
-    user_id: int, connection_id: int, client: Optional[QdrantClient] = None
+    user_id: int, connection_id: int, client: Optional[Engine] = None
 ) -> Dict[str, Any]:
     """How many table chunks are indexed for one connection - used by the
     API layer to report indexing results, and handy when debugging "why
     doesn't it know about my table"."""
-    client = client or get_qdrant_client()
-    result = client.count(
-        collection_name=COLLECTION_NAME,
-        count_filter=qmodels.Filter(
-            must=[
-                qmodels.FieldCondition(key="user_id", match=qmodels.MatchValue(value=user_id)),
-                qmodels.FieldCondition(
-                    key="connection_id", match=qmodels.MatchValue(value=connection_id)
-                ),
-            ]
-        ),
-        exact=True,
+    count = vector_store.count_rows(
+        vector_store.schema_chunks, user_id, connection_id, engine=client
     )
-    return {"indexed_tables": result.count}
+    return {"indexed_tables": count}

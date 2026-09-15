@@ -29,7 +29,7 @@ from app.engine.db_adapters.readonly import (
     validate_mongo_operation,
     wrap_with_row_limit,
 )
-from app.engine.db_adapters.sqlite_adapter import SQLiteAdapter
+from app.engine.db_adapters.sqlite_adapter import SQLiteAdapter, _local_copy
 
 # --- (1) SELECT / WITH are allowed -----------------------------------------
 
@@ -414,12 +414,13 @@ def test_sqlite_file_is_opened_read_only_so_a_write_fails_even_at_the_driver(
     so the guard is not the only thing standing between a model and the
     user's data."""
     adapter = SQLiteAdapter()
-    connection = adapter._connect(sqlite_connection, timeout_seconds=5)
-    try:
-        with pytest.raises(sqlite3.OperationalError):
-            connection.execute("DELETE FROM orders")
-    finally:
-        connection.close()
+    with _local_copy(sqlite_connection) as path:
+        connection = adapter._open(path, timeout_seconds=5)
+        try:
+            with pytest.raises(sqlite3.OperationalError):
+                connection.execute("DELETE FROM orders")
+        finally:
+            connection.close()
 
 
 def test_sqlite_adapter_introspects_columns_keys_and_samples(sqlite_connection):

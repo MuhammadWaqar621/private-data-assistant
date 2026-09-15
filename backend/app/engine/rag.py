@@ -7,8 +7,9 @@ message, whether the question needs data at all - there is no Python
 branching between canned prompts, and no keyword detection of "is this a
 greeting". `schema_context` (app/engine/schema_rag.py) and
 `example_context` (app/engine/example_rag.py) are both retrieved by the
-caller from Qdrant BEFORE this function is called - this module never
-queries Qdrant itself, only assembles what it's handed into the prompt.
+caller from Postgres/pgvector BEFORE this function is called - this module
+never queries that storage itself, only assembles what it's handed into the
+prompt.
 
   - `run_query(query)`   - one string argument. For a SQL connection that
                            string is SQL the model wrote; for a MongoDB

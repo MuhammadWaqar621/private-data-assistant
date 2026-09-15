@@ -31,9 +31,10 @@ migration is what actually runs against Postgres (see the README).
 
 Two test files are deliberately different:
 
-  - `test_schema_qdrant_isolation.py` runs against a REAL Qdrant instance
-    with a disposable, uniquely-named collection per test. Qdrant's
-    payload filtering is the single most important property in this
+  - `test_pgvector_isolation.py` runs against a REAL Postgres+pgvector
+    instance, with a disposable, uniquely-named Postgres schema per test
+    (skipping cleanly, not failing, if none is reachable). pgvector's
+    row-level filtering is the single most important property in this
     project, so it is tested against the real thing rather than a mock.
   - `test_db_adapters_readonly.py` imports nothing but
     `app/engine/db_adapters/readonly.py` (pure functions, stdlib only) and
